@@ -24,13 +24,13 @@ exactly one machine, instead of being a general runner like llama.cpp.
 
 ## Speed
 
-Measured on the real server with a real agent conversation (Radeon 780M, 16 GB VRAM, Qwen3.6-35B-A3B UD-Q4_K_S,
-f16 KV cache, MTP on):
+Measured on the real server with a real agent conversation (Radeon 780M, 2 GB of VRAM from the BIOS and the rest
+in GTT, Qwen3.6-35B-A3B UD-Q4_K_S, f16 KV cache, MTP on). Generation is the mean of two answers per context size:
 
-| context | 12.6K | 28K | 44K | 60K | 78K | 93K |
-|---|---|---|---|---|---|---|
-| prefill (tokens/s) | 224 | 193 | 168 | 148 | 132 | 120 |
-| generation (tokens/s) | 32.8 | 28.4 | 26.4 | 23.7 | 22.5 | 21.1 |
+| context | 12.6K | 28K | 44K | 60K | 78K | 93K | 109K | 115K |
+|---|---|---|---|---|---|---|---|---|
+| prefill (tokens/s) | 218 | 191 | 168 | 149 | 133 | 119 | 111 | 104 |
+| generation (tokens/s) | 29.6 | 27.4 | 26.1 | 23.3 | 22.7 | 20.1 | 19.3 | 19.1 |
 
 For reference, on the same machine `llama-bench` generates 23.4 tokens/s without MTP at empty context, and LM
 Studio logs 29–30 tokens/s with MTP. Method, more numbers and the correctness checks: [engine/BENCHMARKS.md](engine/BENCHMARKS.md).
@@ -39,8 +39,9 @@ Studio logs 29–30 tokens/s with MTP. Method, more numbers and the correctness 
 
 - **Models**: Qwen3.6-35B-A3B and fine-tunes with the same architecture (tested: Tiel-Coder-35B-A3B,
   Ornith-1.5-35B-A3B). Experimental: Flint 40B-A2.5B. Quantizations Q8_0, Q3_K, Q4_K, Q6_K, Q4_1, F32, BF16.
-- **GPU**: developed and tested only on the Radeon 780M (RDNA 3, gfx1103) with 16 GB of VRAM set in the BIOS and
-  64 GB of system RAM. With a 64K context the default model takes about 23 GB of GPU memory (VRAM plus GTT).
+- **GPU**: developed and tested only on the Radeon 780M (RDNA 3, gfx1103) with 64 GB of system RAM and 2 GB of VRAM
+  set in the BIOS: the GPU maps the rest of its memory as GTT. With a 64K context the default model takes about
+  23 GB of GPU memory (VRAM plus GTT).
   Other Vulkan GPUs may work but are untested.
 - **OS**: Linux. On the 780M, Linux 7.1 and 7.2 kernels without a recent TTM fix can crash the system when GPU memory is
   swapped out; the fix and how it was tested are in `kernel/`.
