@@ -93,10 +93,4 @@ fn row(kind: u32, wid: vec3<u32>, t: u32) {
 }
 
 @compute @workgroup_size(64)
-fn mv_q8_0(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) t: u32) { row(0u, wid, t); }
-@compute @workgroup_size(64)
-fn mv_q4_k(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) t: u32) { row(1u, wid, t); }
-@compute @workgroup_size(64)
-fn mv_q6_k(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) t: u32) { row(2u, wid, t); }
-@compute @workgroup_size(64)
 fn mv_f32(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) t: u32) { row(3u, wid, t); }

@@ -40,43 +40,6 @@ fn kv_write(@builtin(global_invocation_id) gid: vec3<u32>) {
 // One workgroup per query head (32), one thread per dimension (128). a = q (32 x 128), b = K cache, c = V cache,
 // d = sinks (32), sc = scratch (32 x p.ctx), o = output (32 x 128). Positions p.lo .. p.lo + p.n - 1 are read.
 // Query head h reads KV head h / 8. Scores scaled by 1/sqrt(128) before the softmax, as ggml.
-var<workgroup> red: array<f32, 128>;
-@compute @workgroup_size(128)
-fn attn_sink(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) t: u32) {
-  let h = wid.x; let g = h / 8u; let q0 = h * 128u; let s0 = h * p.ctx;
-  let scale = 1.0 / sqrt(128.0);
-  var mx = -3.0e38;
-  for (var j = t; j < p.n; j += 128u) {
-    let k0 = ((p.lo + j) % p.ring) * 512u + g * 128u;
-    var s = 0.0;
-    for (var e: u32 = 0u; e < 128u; e++) { s += a[q0 + e] * b[k0 + e]; }
-    s = s * scale;
-    sc[s0 + j] = s;
-    mx = max(mx, s);
-  }
-  red[t] = mx;
-  workgroupBarrier();
-  for (var m: u32 = 64u; m > 0u; m >>= 1u) {
-    if (t < m) { red[t] = max(red[t], red[t + m]); }
-    workgroupBarrier();
-  }
-  let sink = d[h];
-  let mm = max(red[0], sink);
-  workgroupBarrier();
-  var sum = 0.0;
-  for (var j = t; j < p.n; j += 128u) { let e = exp(sc[s0 + j] - mm); sc[s0 + j] = e; sum += e; }
-  red[t] = sum;
-  storageBarrier();
-  workgroupBarrier();
-  for (var m: u32 = 64u; m > 0u; m >>= 1u) {
-    if (t < m) { red[t] += red[t + m]; }
-    workgroupBarrier();
-  }
-  let den = red[0] + exp(sink - mm);
-  var acc = 0.0;
-  for (var j: u32 = 0u; j < p.n; j++) { acc += sc[s0 + j] * c[((p.lo + j) % p.ring) * 512u + g * 128u + t]; }
-  o[q0 + t] = acc / den;
-}
 
 // ===================== prefill of a block (F4) =====================
 // RoPE of a block: workgroup (head, token); table of token t at b[t * 128]. Rows in a: (token * heads + head) * 128.

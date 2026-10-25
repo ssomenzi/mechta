@@ -11,7 +11,7 @@
 #                                to the whole network: only with a firewall in front and, preferably, with MECHTA_API_KEY.
 #   MECHTA_API_KEY=<key>         if set, /v1/* requires `Authorization: Bearer <key>` (/health stays open)
 #   MECHTA_PREFLIGHT=<command>   a machine check run before the start; the server starts only if it exits with 0
-#   MECHTA_KV=f32|f16|q8 (KV cache format, default f16) · MECHTA_MTP_ACCEPT=exact|greedy · MECHTA_THINKING=no
+#   MECHTA_KV=f32|f16 (KV cache format, default f16) · MECHTA_MTP_ACCEPT=exact|greedy · MECHTA_THINKING=no
 #   MECHTA_CTX=N (context in tokens, multiple of 1024, 4096-262144; default 65536: `mechta check-memory` says whether it fits)
 #   MECHTA_THINK_BUDGET=N (limit on reasoning, 0 = none) · MECHTA_FLINT_KV=f16 (K/V cache of a Flint model in f16)
 UNIT=mechta-serve

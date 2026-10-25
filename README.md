@@ -15,7 +15,7 @@ exactly one machine, instead of being a general runner like llama.cpp.
   tokens per step. The output has the same distribution as without MTP.
 - **Prefix cache across sessions**: the state after a long system prompt is saved to disk and reloaded, so a new
   agent session does not recompute it.
-- **Long context**: up to 262,144 tokens, KV cache in f16 (default), f32 or q8. A memory check before the start
+- **Long context**: up to 262,144 tokens, KV cache in f16 (default) or f32. A memory check before the start
   says whether the chosen context fits.
 - **GPU kernels in WGSL** on `wgpu` (Vulkan), including flash attention on the matrix units of RDNA 3 for the prefill.
 - **Safe Rust**: every crate forbids `unsafe` except one small crate with two documented calls.
@@ -97,7 +97,8 @@ Add the `provider.mechta` block of `engine/opencode-mechta.json` to your `openco
 | `kernel/` | the Linux kernel fix for the TTM crash on the 780M |
 | `model.md` | a study of the model: architecture, sizes, memory per token |
 
-How it was built, step by step: [engine/DEVLOG.md](engine/DEVLOG.md).
+How it was built, step by step: [engine/DEVLOG.md](engine/DEVLOG.md). This branch contains only what the server uses. The
+`lab` branch keeps every kernel variant and measurement tool written on the way, described in its `engine/VARIANTS.md`.
 
 ## License
 

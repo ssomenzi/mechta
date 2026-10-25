@@ -13,7 +13,7 @@ mod tests {
 
     #[test]
     fn ops_for_every_kv_format() {
-        for f in [KvFormat::F32, KvFormat::F16, KvFormat::Q8, KvFormat::F16Sim] { check(&format!("ops.wgsl ({})", f.name()), &ops_source(f)); }
+        for f in [KvFormat::F32, KvFormat::F16] { check(&format!("ops.wgsl ({})", f.name()), &ops_source(f)); }
     }
 
     #[test]
@@ -28,13 +28,12 @@ mod tests {
     #[test]
     fn other_shaders() {
         for (n, s) in [
-            ("matvec.wgsl", include_str!("wgsl/matvec.wgsl")), ("matvec2.wgsl", include_str!("wgsl/matvec2.wgsl")),
-            ("matvec3.wgsl", include_str!("wgsl/matvec3.wgsl")), ("routing.wgsl", include_str!("wgsl/routing.wgsl")),
-            ("delta.wgsl", include_str!("wgsl/delta.wgsl")), ("matvec_n4.wgsl", include_str!("wgsl/matvec_n4.wgsl")),
+            ("matvec.wgsl", include_str!("wgsl/matvec.wgsl")), ("routing.wgsl", include_str!("wgsl/routing.wgsl")),
+            ("matvec_n4.wgsl", include_str!("wgsl/matvec_n4.wgsl")),
             ("matvec_nh.wgsl", include_str!("wgsl/matvec_nh.wgsl")), ("merge.wgsl", include_str!("wgsl/merge.wgsl")), ("dequant.wgsl", include_str!("wgsl/dequant.wgsl")),
         ] { check(n, s); }
-        // the four sources with Q3_K: exactly the text the engine compiles (engine::q3_source)
-        for n in ["matvec4", "matvec_u", "matvec_uh", "gemm"] { check(&format!("{n} (sorgente_q3)"), &crate::engine::q3_source(n)); }
+        // the three sources with Q3_K: exactly the text the engine compiles (engine::q3_source)
+        for n in ["matvec4", "matvec_uh", "gemm"] { check(&format!("{n} (q3_source)"), &crate::engine::q3_source(n)); }
         // Flint: routing, sum, and the attention source with each K/V format (exactly what Flint compiles)
         check("flint_moe.wgsl", include_str!("wgsl/flint_moe.wgsl"));
         check("flint_sum.wgsl", include_str!("wgsl/flint_sum.wgsl"));

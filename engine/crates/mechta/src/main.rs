@@ -2,26 +2,11 @@
 #![forbid(unsafe_code)]
 use mechta_gguf::Gguf;
 use std::collections::BTreeMap;
-mod verify;
 mod engine;
-mod generate;
-pub mod profile;
-mod memtest;
-mod bench;
-mod bench_delta;
-mod bench_n;
-mod bench_experts;
-mod mtp;
-mod step2;
-mod generate_mtp;
-mod vocab;
-mod read_only;
-mod phases;
-mod vram;
+mod tools;
 mod memcheck;
 mod compare;
 mod wgsl_check;
-mod q3k_check;
 pub mod session;
 pub mod flint;
 pub mod session_flint;
@@ -51,42 +36,9 @@ fn main() {
     match args.get(1).map(String::as_str) {
         Some("inspect") => inspect(&args.get(2).cloned().unwrap_or_else(model_path)),
         Some("token") => token(&args[2], &args[3]),
-        // Flint, F3 of PLAN-FLINT.md (one token at a time against the llama.cpp reference)
-        Some("flint-verify") => flint::verify(&args[2]),
         Some("flint-logit-dump") => flint::logit_dump(&args[2], args[3].parse().expect("prefill"), args[4].parse().expect("steps"), &args[5]),
-        Some("flint-profile") => flint::profile(&args[2].split(',').map(|v| v.parse().expect("pos")).collect::<Vec<usize>>()),
-        Some("flint-prefill") => flint::verify_prefill(&args[2], args[3].parse().expect("n"), args.get(4).map(|v| v.parse().expect("k"))),
-        Some("flint-attn") => verify::flint_attn(&args[2], &args[3].split(',').map(|v| v.parse().unwrap()).collect::<Vec<usize>>(), &args[4].split(',').map(|v| v.parse().unwrap()).collect::<Vec<i32>>()),
-        Some("flint-gemm") => verify::flint_gemm(args[2].parse().expect("layer")),
-        Some("flint-ffn") => verify::flint_ffn(&args[2], &args[3].split(',').map(|v| v.parse().unwrap()).collect::<Vec<usize>>(), &args[4].split(',').map(|v| v.parse().unwrap()).collect::<Vec<i32>>()),
-        Some("layer") => verify::layer(&args[2..].iter().map(|s| s.parse().expect("position")).collect::<Vec<i32>>()),
-        Some("generate") => generate::generate(),
-        Some("profile") => profile::profile(args.get(2).map(String::as_str)),
-        Some("profile-prefill") => profile::profile_prefill(&args[2]),
-        Some("session-phases") => phases::session_phases(&args[2], &args[3], args[4].parse().expect("chars"), args[5].parse().expect("max_tokens")),
-        Some("probe-experts") => profile::probe_experts(&args[2], args[3].parse().expect("n"), &args[4]),
-        Some("compare-probe") => profile::compare_probe(&args[2], &args[3]),
-        Some("profile-prefill-at") => profile::profile_prefill_at(&args[2], args[3].parse().expect("n"), &args[4]),
-        Some("profile2") => profile::profile2(),
-        Some("prefill-span") => profile::prefill_span(&args[2], &args[3]),
-        Some("kv-check") => profile::kv_check(),
-        Some("bench-cycle") => profile::bench_cycle(args[2].parse().unwrap()),
-        Some("bench-step") => profile::bench_step(args[2].parse().unwrap()),
-        Some("check-attn2") => profile::check_attn2(&args[2], args[3].parse().unwrap(), &args[4]),
-        Some("bench-attn") => profile::bench_attn(&args[2]),
-        Some("kv-dump") => profile::kv_dump(&args[2], args[3].parse().unwrap(), args[4].parse().unwrap(), &args[5]),
-        Some("bench-kv") => profile::bench_kv(&args[2]),
-        // logits of any variant, and the comparison of two runs (KL, top-1, NLL)
-        Some("verify-q3k") => q3k_check::verify_q3k(&args[2], &args[3]),
-        Some("logit-dump") => profile::logit_dump(&args[2], args[3].parse().unwrap(), args[4].parse().unwrap(), &args[5], args.get(6).is_some_and(|m| m == "double")),
+        Some("logit-dump") => tools::logit_dump(&args[2], args[3].parse().unwrap(), args[4].parse().unwrap(), &args[5], args.get(6).is_some_and(|m| m == "double")),
         Some("kl") => compare::kl(&args[2], &args[3], &args[4..].iter().map(|a| compare::parse_limit(a).unwrap_or_else(|e| { eprintln!("{e}"); std::process::exit(2) })).collect::<Vec<_>>()),
-        Some("block-cost") => profile::block_cost(&args[2], &args[3], args.get(4).and_then(|v| v.parse().ok()).unwrap_or(5)),
-        Some("quality-kv") => profile::quality_kv(&args[2], args[3].parse().unwrap(), args[4].parse().unwrap(), &args[5]),
-        Some("bench") => bench::bench(&args[2], &args[3], args.get(4).and_then(|s| s.parse().ok()).unwrap_or(50)),
-        Some("bench-delta") => bench_delta::bench_delta(&args[2], args.get(3).and_then(|s| s.parse().ok()).unwrap_or(50)),
-        Some("mtp") => mtp::mtp(),
-        Some("mtp2") => mtp::mtp2(),
-        Some("vocab") => vocab::vocab(&args[2]),
         // OpenAI-compatible server: 127.0.0.1:4131, thinking on; MECHTA_ADDRESS / MECHTA_THINKING=no
         // `serve [--ctx N]`: context size at start (or MECHTA_CTX; default 65536). Before loading the model
         // the memory check runs: if the context does not fit, the server does not start and says the largest that fits.
@@ -132,19 +84,11 @@ fn main() {
             }
         }
         Some("test-budget") => session::test_budget(args.get(2).and_then(|v| v.parse().ok()).unwrap_or(256), args.get(3).and_then(|v| v.parse().ok()).unwrap_or(1500)),
-        Some("test-session") => session::test_session(&args[2], args.get(3).and_then(|s| s.parse().ok()).unwrap_or(200)),
-        Some("generate-mtp") => generate_mtp::generate_mtp(args.get(2).map(String::as_str), args.get(3).and_then(|s| s.parse().ok())),
-        Some("step2") => step2::step2(&args[2..].iter().map(|s| s.parse().expect("position")).collect::<Vec<usize>>()),
-        Some("bench-experts") => bench_experts::bench_experts(&args[2], args[3].parse().expect("n"), args.get(4).and_then(|s| s.parse().ok()).unwrap_or(20), args.get(5).map(String::as_str).unwrap_or("r")),
-        Some("bench-n") => bench_n::bench_n(&args[2], args[3].parse().expect("n"), args.get(4).and_then(|s| s.parse().ok()).unwrap_or(50), args.get(5).map(String::as_str).unwrap_or("a")),
-        Some("read-only") => read_only::read_only(args.get(2).and_then(|s| s.parse().ok()).unwrap_or(11)),
-        Some("phases") => phases::phases(&args[2]),
-        Some("vram") => vram::vram(&args[2], args[3].parse().unwrap(), &args[4]),
-        Some("memtest") => memtest::memtest(&args[2], args.get(3).map(String::as_str).unwrap_or("default")),
         Some("deq") => deq(&args[2], args[3].parse().expect("N"), &args[4]),
-        _ => eprintln!("usage: mechta inspect [file.gguf] | mechta token <text.txt> <llamacpp_ids.bin> | mechta deq <tensor> <N> <reference.f32> | mechta layer <pos>..."),
+        _ => eprintln!("usage: mechta serve [--ctx N] | check-memory [ctx] | logit-dump | kl | flint-logit-dump | test-budget | inspect [file.gguf] | token <text.txt> <llamacpp_ids.bin> | deq <tensor> <N> <reference.f32>"),
     }
 }
+
 
 fn inspect(path: &str) {
     let g = match Gguf::open(path) { Ok(g) => g, Err(e) => { eprintln!("{path}: {e}"); std::process::exit(1) } };

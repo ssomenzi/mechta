@@ -19,15 +19,11 @@ pub struct Gpu { pub device: wgpu::Device, pub queue: wgpu::Queue, pub info: wgp
     /// It costs a core at 100% while the GPU works; the test machine is dedicated to mechta. MECHTA_POLL=sleeping to turn it off.
     pub poll_active: bool }
 
-/// Prefill attention on the matrix units (attn_fa_mx), MECHTA_PREFILL_ATTN: `mx` or `mx2` yes; `fa` or `fd4` no;
-/// unset = yes when the KV cache is f16 (MECHTA_KV unset or f16), the default
-/// (measured on the real server: prefill +6% at 12.6K up to +45% at 93K over attn_fa).
+/// Prefill attention on the matrix units (attn_fa_mx): used with the f16 KV cache (MECHTA_KV unset or f16), so the
+/// device is asked for cooperative matrices then (measured on the real server: prefill +6% at 12.6K up to +45% at 93K
+/// over attn_fa).
 pub fn prefill_mx_requested() -> bool {
-    match std::env::var("MECHTA_PREFILL_ATTN").unwrap_or_default().as_str() {
-        "mx" | "mx2" => true,
-        "" => matches!(std::env::var("MECHTA_KV").unwrap_or_default().as_str(), "" | "f16"),
-        _ => false,
-    }
+    matches!(std::env::var("MECHTA_KV").unwrap_or_default().as_str(), "" | "f16")
 }
 
 impl Gpu {
@@ -42,7 +38,7 @@ impl Gpu {
         // the matrix units for attn_fa_mx, an experimental feature of wgpu (the default)
         let mx = prefill_mx_requested();
         let feat_mx = wgpu::Features::EXPERIMENTAL_COOPERATIVE_MATRIX | wgpu::Features::SHADER_F16;
-        if mx { assert!(adapter.features().contains(feat_mx), "MECHTA_PREFILL_ATTN=mx: this GPU has no cooperative matrices"); feat |= feat_mx; }
+        if mx { assert!(adapter.features().contains(feat_mx), "the prefill with the f16 KV cache needs cooperative matrices, and this GPU has none (MECHTA_KV=f32 works without)"); feat |= feat_mx; }
         let experimental_features = if mx { mechta_shader::experimental_features_on() } else { wgpu::ExperimentalFeatures::disabled() };
         let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor { label: Some("mechta"), required_features: feat, required_limits: adapter.limits(), memory_hints, experimental_features, ..Default::default() }))
             .expect("request_device");

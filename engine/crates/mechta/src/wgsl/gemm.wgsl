@@ -137,14 +137,6 @@ fn gemm(kind: u32, wid: vec3<u32>, t: u32) {
     }
   }
 }
-@compute @workgroup_size(256)
-fn gemm_q8_0(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) t: u32) { gemm(0u, wid, t); }
-@compute @workgroup_size(256)
-fn gemm_q4_k(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) t: u32) { gemm(1u, wid, t); }
-@compute @workgroup_size(256)
-fn gemm_q6_k(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) t: u32) { gemm(2u, wid, t); }
-@compute @workgroup_size(256)
-fn gemm_f32(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) t: u32) { gemm(3u, wid, t); }
 
 // ===================== NARROW variant for the experts =====================
 // Block profile: the three expert GEMMs cost 500 ms per block each (80% of the prefill):
@@ -193,12 +185,6 @@ fn gemm8(kind: u32, wid: vec3<u32>, t: u32) {
   if (c < ncol) { let e = ids[512u + cbase + c]; y[((e >> 3u) * 8u + (e & 7u)) * p.rows + r] = acc0; }
   if (c + 1u < ncol) { let e = ids[512u + cbase + c + 1u]; y[((e >> 3u) * 8u + (e & 7u)) * p.rows + r] = acc1; }
 }
-@compute @workgroup_size(256)
-fn gemm8_q8_0(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) t: u32) { gemm8(0u, wid, t); }
-@compute @workgroup_size(256)
-fn gemm8_q4_k(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) t: u32) { gemm8(1u, wid, t); }
-@compute @workgroup_size(256)
-fn gemm8_q6_k(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) t: u32) { gemm8(2u, wid, t); }
 
 // ===================== 128 x 16 variant for the experts =====================
 // Measurement of the phases of gemm8 at 512 tokens: weights 645 ms (28 GB/s), compute 1,400 ms (0.74 TFLOP/s). Here:
@@ -261,12 +247,6 @@ fn gemm16(kind: u32, wid: vec3<u32>, t: u32) {
     if (cb < ncol) { y[yb + r] = acc1[j]; }
   }
 }
-@compute @workgroup_size(256)
-fn gemm16_q8_0(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) t: u32) { gemm16(0u, wid, t); }
-@compute @workgroup_size(256)
-fn gemm16_q4_k(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) t: u32) { gemm16(1u, wid, t); }
-@compute @workgroup_size(256)
-fn gemm16_q6_k(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) t: u32) { gemm16(2u, wid, t); }
 
 // ===================== R variant for the experts: weights in registers =====================
 // Phases of gemm16: writing the weights into shared memory costs as much as the compute. Here the weights do NOT go
@@ -323,69 +303,11 @@ fn gemm_r(kind: u32, wid: vec3<u32>, t: u32) {
     y[((e >> 3u) * 8u + (e & 7u)) * p.rows + r] = v;
   }
 }
-@compute @workgroup_size(256)
-fn gemmr_q8_0(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) t: u32) { gemm_r(0u, wid, t); }
-@compute @workgroup_size(256)
-fn gemmr_q4_k(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) t: u32) { gemm_r(1u, wid, t); }
-@compute @workgroup_size(256)
-fn gemmr_q6_k(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) t: u32) { gemm_r(2u, wid, t); }
 
 // ===================== R2 variant: two pieces per lane at each step =====================
 // Bench: all variants sit at ~10 GB/s on the touched weights and ~600 GFLOP/s, neither bandwidth- nor compute-bound.
 // Hypothesis to check with the bench: exposed latency, each thread has only 8 words of weights (32 B) in flight per step, with
 // 2 barriers every 128 k. Here each lane does 2 pieces per step (256 k): 16 words in flight, half the barriers.
-var<workgroup> Xr2: array<vec4<f32>, 1152>;   // [token 16][lane 4][piece 2][vec4 8] with stride 9 per (lane, piece): 72 per token
-fn gemm_r2(kind: u32, wid: vec3<u32>, t: u32) {
-  let r0 = wid.x * BM; let c0 = wid.y * BNR; let z = wid.z;
-  let cbase = ids[2u * z]; let ncol = ids[2u * z + 1u];
-  if (c0 >= ncol) { return; }
-  let u = p.k / 32u; let steps = u / 8u;          // steps of 8 pieces (256 k)
-  let row = t / 4u; let lane = t % 4u;
-  let rr = z * p.rows + min(r0 + row, p.rows - 1u);
-  // x load: 4 vec4 per thread per step: v = t + 256 j → token v / 64, vec4 v % 64 (group (v % 64) / 8, j = v % 8)
-  var xo: array<u32, 4>; var so: array<u32, 4>;
-  for (var j: u32 = 0u; j < 4u; j++) {
-    let v = t + 256u * j;
-    let e = ids[512u + cbase + min(c0 + v / 64u, ncol - 1u)];
-    xo[j] = (((e >> 3u) * p.x_tok + (e & 7u) * p.x_step_i) >> 2u) + (v % 64u);
-    so[j] = (v / 64u) * 72u + ((v % 64u) / 8u) * 9u + (v % 8u);
-  }
-  var acc: array<f32, 16>;
-  for (var s: u32 = 0u; s < steps; s++) {
-    for (var j: u32 = 0u; j < 4u; j++) { Xr2[so[j]] = x4[xo[j] + 64u * s]; }
-    workgroupBarrier();
-    let ia = 8u * s + 2u * lane; let ib = ia + 1u;   // the two pieces of this lane
-    let a0 = decod8(kind, rr, ia, 0u); let a1 = decod8(kind, rr, ia, 2u); let a2 = decod8(kind, rr, ia, 4u); let a3 = decod8(kind, rr, ia, 6u);
-    let b0 = decod8(kind, rr, ib, 0u); let b1 = decod8(kind, rr, ib, 2u); let b2 = decod8(kind, rr, ib, 4u); let b3 = decod8(kind, rr, ib, 6u);
-    let xa = 2u * lane * 9u; let xb = xa + 9u;
-    for (var c: u32 = 0u; c < 16u; c++) {
-      let p0 = c * 72u + xa; let p1 = c * 72u + xb;
-      acc[c] += dot(a0[0], Xr2[p0]) + dot(a0[1], Xr2[p0 + 1u]) + dot(a1[0], Xr2[p0 + 2u]) + dot(a1[1], Xr2[p0 + 3u])
-              + dot(a2[0], Xr2[p0 + 4u]) + dot(a2[1], Xr2[p0 + 5u]) + dot(a3[0], Xr2[p0 + 6u]) + dot(a3[1], Xr2[p0 + 7u])
-              + dot(b0[0], Xr2[p1]) + dot(b0[1], Xr2[p1 + 1u]) + dot(b1[0], Xr2[p1 + 2u]) + dot(b1[1], Xr2[p1 + 3u])
-              + dot(b2[0], Xr2[p1 + 4u]) + dot(b2[1], Xr2[p1 + 5u]) + dot(b3[0], Xr2[p1 + 6u]) + dot(b3[1], Xr2[p1 + 7u]);
-    }
-    workgroupBarrier();
-  }
-  if (lane > 0u) { for (var c: u32 = 0u; c < 16u; c++) { red[((lane - 1u) * 64u + row) * 16u + c] = acc[c]; } }
-  workgroupBarrier();
-  if (lane != 0u) { return; }
-  let r = r0 + row;
-  if (r >= p.rows) { return; }
-  for (var c: u32 = 0u; c < 16u; c++) {
-    let col = c0 + c;
-    if (col >= ncol) { break; }
-    let e = ids[512u + cbase + col];
-    let v = acc[c] + red[(row) * 16u + c] + red[(64u + row) * 16u + c] + red[(128u + row) * 16u + c];
-    y[((e >> 3u) * 8u + (e & 7u)) * p.rows + r] = v;
-  }
-}
-@compute @workgroup_size(256)
-fn gemmr2_q8_0(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) t: u32) { gemm_r2(0u, wid, t); }
-@compute @workgroup_size(256)
-fn gemmr2_q4_k(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) t: u32) { gemm_r2(1u, wid, t); }
-@compute @workgroup_size(256)
-fn gemmr2_q6_k(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) t: u32) { gemm_r2(2u, wid, t); }
 
 // ===================== R3/R4 variants: 2 or 4 rows per thread, weights in registers =====================
 // Bench r versus r2: r2 (twice the bytes in flight, half the barriers) is NOT faster: the latency
@@ -456,18 +378,6 @@ fn gemm_rh(kind: u32, wid: vec3<u32>, t: u32, rh: u32) {
     workgroupBarrier();
   }
 }
-@compute @workgroup_size(256)
-fn gemmr3_q4_k(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) t: u32) { gemm_rh(1u, wid, t, 2u); }
-@compute @workgroup_size(256)
-fn gemmr3_q6_k(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) t: u32) { gemm_rh(2u, wid, t, 2u); }
-@compute @workgroup_size(256)
-fn gemmr3_q8_0(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) t: u32) { gemm_rh(0u, wid, t, 2u); }
-@compute @workgroup_size(256)
-fn gemmr4_q4_k(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) t: u32) { gemm_rh(1u, wid, t, 4u); }
-@compute @workgroup_size(256)
-fn gemmr4_q6_k(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) t: u32) { gemm_rh(2u, wid, t, 4u); }
-@compute @workgroup_size(256)
-fn gemmr4_q8_0(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) t: u32) { gemm_rh(0u, wid, t, 4u); }
 
 // ===================== R5 variant: 2 rows per thread, x read ONCE for both rows =====================
 // Bench r4: removing the decoding, the reads of x or those of the weights changes little (10 → 9 ms): the cost

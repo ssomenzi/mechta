@@ -46,28 +46,25 @@ pub fn ctx() -> usize {
 
 fn fb(v: f32) -> u32 { v.to_bits() }
 
-/// Format of the KV cache. MECHTA_KV=f16 (default) | f32 | q8 (int8 + one f32 scale per 32 values).
-/// The attention reads the whole cache at every generated token: f16 halves those bytes, q8 cuts them to 1.125/4.
+/// Format of the KV cache. MECHTA_KV=f16 (default) | f32.
+/// The attention reads the whole cache at every generated token: f16 halves those bytes.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum KvFormat { F32, F16, Q8, F16Sim }
+pub enum KvFormat { F32, F16 }
 pub fn kv_format() -> KvFormat {
     static F: std::sync::OnceLock<KvFormat> = std::sync::OnceLock::new();
     *F.get_or_init(|| match std::env::var("MECHTA_KV").unwrap_or_default().as_str() {
-        "f32" => KvFormat::F32, "" | "f16" => KvFormat::F16, "q8" => KvFormat::Q8,
-        "f16sim" => KvFormat::F16Sim,   // test only: f32 cache, each value rounded to f16 when read
-        x => panic!("MECHTA_KV={x}: use f32, f16 or q8"),
+        "f32" => KvFormat::F32, "" | "f16" => KvFormat::F16,
+        x => panic!("MECHTA_KV={x}: use f16 or f32"),
     })
 }
 impl KvFormat {
-    pub fn name(self) -> &'static str { match self { KvFormat::F32 => "f32", KvFormat::F16 => "f16", KvFormat::Q8 => "q8", KvFormat::F16Sim => "f16sim" } }
-    /// u32 words of data for `n` cache elements (q8: the scales are after the data, see `scale_words`)
-    pub fn data_words(self, n: usize) -> usize { match self { KvFormat::F32 | KvFormat::F16Sim => n, KvFormat::F16 => n / 2, KvFormat::Q8 => n / 4 } }
-    /// q8 only: words of scales for `n` elements, stored from word `data_words(ctx() * 512)`
-    pub fn scale_words(self, n: usize) -> usize { if self == KvFormat::Q8 { n / 32 } else { 0 } }
+    pub fn name(self) -> &'static str { match self { KvFormat::F32 => "f32", KvFormat::F16 => "f16" } }
+    /// u32 words for `n` cache elements
+    pub fn data_words(self, n: usize) -> usize { match self { KvFormat::F32 => n, KvFormat::F16 => n / 2 } }
     /// bytes of one KV buffer (K or V of one layer) for the whole context
     pub fn buffer_bytes(self) -> u64 { self.buffer_bytes_for(ctx()) }
     /// the same for a context of `ctx` tokens (memory check before the start)
-    pub fn buffer_bytes_for(self, ctx: usize) -> u64 { 4 * (self.data_words(ctx * 512) + self.scale_words(ctx * 512)) as u64 }
+    pub fn buffer_bytes_for(self, ctx: usize) -> u64 { 4 * self.data_words(ctx * 512) as u64 }
 }
 /// Format of the token embedding table: (dequant.wgsl entry, bytes of one row
 /// of 2048 values, blocks per row); Ornith has token_embd in Q4_K. Before, Q8_0 was assumed everywhere (2176 bytes, 64 blocks).
@@ -77,12 +74,12 @@ pub fn emb_format(g: &Gguf) -> (&'static str, u64, u32) {
         x => panic!("token_embd.weight: {x:?} not supported"),
     }
 }
-/// The four shader files that use the Q3_K decoding (q3k.wgsl), with it appended. Every pipeline built from
+/// The three shader files that use the Q3_K decoding (q3k.wgsl), with it appended. Every pipeline built from
 /// them must take the source from here: compiled alone they do not parse.
 pub fn q3_source(name: &str) -> String {
     let s = match name {
-        "matvec4" => include_str!("wgsl/matvec4.wgsl"), "matvec_u" => include_str!("wgsl/matvec_u.wgsl"),
-        "matvec_uh" => include_str!("wgsl/matvec_uh.wgsl"), "gemm" => include_str!("wgsl/gemm.wgsl"), x => panic!("q3_source({x})"),
+        "matvec4" => include_str!("wgsl/matvec4.wgsl"), "matvec_uh" => include_str!("wgsl/matvec_uh.wgsl"),
+        "gemm" => include_str!("wgsl/gemm.wgsl"), x => panic!("q3_source({x})"),
     };
     format!("{s}\n{}", include_str!("wgsl/q3k.wgsl"))
 }
@@ -90,24 +87,19 @@ pub fn q3_source(name: &str) -> String {
 pub fn ops_source(f: KvFormat) -> String {
     let ops = include_str!("wgsl/ops.wgsl");
     if f == KvFormat::F32 { return ops.to_string(); }
-    if f == KvFormat::F16Sim {
-        let r = |x: &str| format!("let v = {x}; return vec4<f32>(unpack2x16float(pack2x16float(v.xy)), unpack2x16float(pack2x16float(v.zw)));");
-        return ops.replace("fn kk(i: u32) -> vec4<f32> { return b4[i]; }", &format!("fn kk(i: u32) -> vec4<f32> {{ {} }}", r("b4[i]")))
-                  .replace("fn vv(i: u32) -> vec4<f32> { return c4[i]; }", &format!("fn vv(i: u32) -> vec4<f32> {{ {} }}", r("c4[i]")));
-    }
     let kv = include_str!("wgsl/kv.wgsl");
     let block = |name: &str| -> &str {
         let start = kv.find(&format!("// FORMAT {name}")).expect("kv.wgsl block");
         let rest = &kv[start..]; let end = rest[1..].find("// FORMAT ").map(|e| e + 1).unwrap_or(rest.len());
         &rest[..end]
     };
-    let chosen = block(f.name()).replace("KV_SC_VALUE", &f.data_words(ctx() * 512).to_string());
+    let chosen = block(f.name());
     let (b, e) = (ops.find("// KV-ACCESS-BEGIN").expect("KV-ACCESS-BEGIN"), ops.find("// KV-ACCESS-END").expect("KV-ACCESS-END"));
     format!("{}{}\n{}{}", &ops[..b], chosen, block("common"), &ops[e..])
 }
 /// The kernel that writes K or V into the cache: rope / rope2 / copy (f32), kv_rope / kv_rope2 / kv_copy otherwise.
 fn kv_writer(e: &'static str) -> &'static str {
-    if matches!(kv_format(), KvFormat::F32 | KvFormat::F16Sim) { return e; }
+    if kv_format() == KvFormat::F32 { return e; }
     match e { "rope" => "kv_rope", "rope2" => "kv_rope2", "copy" => "kv_copy", _ => unreachable!() }
 }
 fn attention(il: usize) -> bool { (il + 1) % 4 == 0 }
@@ -135,115 +127,41 @@ pub fn binding_op(e: &str) -> &'static [u32] {
               _ => &[0, 1, 5, 7] }
 }
 
-/// MECHTA_Q4K=64: Q4_K in pieces of 64 values (mv_q4_k64 of matvec4.wgsl), on trial.
-pub fn q4k_64() -> bool {
-    static Q: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *Q.get_or_init(|| std::env::var("MECHTA_Q4K").map(|v| v == "64").unwrap_or(false))
-}
-
-/// Attention: `attn_v2`/`attn2_v2` parallel over the positions (default); MECHTA_ATTN=v1 for the old ones.
-fn attn_entry(double: bool) -> &'static str {
-    let v = std::env::var("MECHTA_ATTN").unwrap_or_default();
-    assert!(v.is_empty() || kv_format() == KvFormat::F32, "MECHTA_ATTN={v} reads the cache as f32: only the default attention reads MECHTA_KV={}", kv_format().name());
-    match (double, v.as_str()) {
-        (false, "v1") => "attn", (true, "v1") => "attn2",
-        (false, "v2") => "attn_v2", (true, "v2") => "attn2_v2",
-        (false, "v3") => "attn_v3", (true, "v3") => "attn2_v3",
-        _ => "fd",   // default: flash-decoding with K/V read once for the 8 Q heads
-    }
-}
-/// Attention in the program: `fd` = two dispatches (blocks + merge), otherwise one dispatch. `ntok` = 1 or 2.
-#[allow(clippy::too_many_arguments)]
+/// Attention of a generation step: flash-decoding, then the merge of the blocks (`attn_fd_combine`). One token:
+/// `attn_fd`, K/V read once for the 8 Q heads, blocks of 128 positions. The double step of MTP: `attn_fd2h`, K/V
+/// read once for both tokens, blocks of 256 positions, 4 rows of V in flight (the merge needs p.flag = ATTN2_FLAG).
 fn attn_op(of: &Factory, c: &mut Vec<Command>, double: bool, kc: &wgpu::Buffer, vc: &wgpu::Buffer, u_att: &wgpu::Buffer) {
     let a = |n: &str| of.a(n); let ntok = if double { 2 } else { 1 };
-    let e = attn_entry(double);
-    if e == "fd" {
-        // double step with K/V read once for both tokens (attn_fd2); MECHTA_ATTN2=old for one workgroup per token
-        if double && attn2_b256() {
-            let e2 = match std::env::var("MECHTA_ATTN2").unwrap_or_default().as_str() { "b256" => "attn_fd2b", "d" => "attn_fd2d", "e" => "attn_fd2e",
-                // measure only (output wrong): the grid of attn_fd2c that only reads K and V
-                "read" => "attn_fd2_read", "read2" => "attn_fd2_read2",
-                // trials: f, g = K read in order (slower), cm = measuring copy
-                "f" => "attn_fd2f", "g" => "attn_fd2g", "cm" => "attn_fd2cm", "c" => "attn_fd2c", "i" => "attn_fd2i",
-                // default: attn_fd2h, 4 rows of V in flight, -18% on attn_fd2c at 45K-124K with
-                // a numeric PASS; MECHTA_ATTN2=c for attn_fd2c (the previous default)
-                _ => "attn_fd2h" };
-            c.push(of.op(e2, &[(0, a("qr")), (9, kc), (10, vc)], a("att_p"), None, u_att, (2, (ctx() / 256) as u32, 1)));
-        } else if double && std::env::var("MECHTA_ATTN2").map(|v| v != "old").unwrap_or(true) {
-            c.push(of.op("attn_fd2", &[(0, a("qr")), (9, kc), (10, vc)], a("att_p"), None, u_att, (2, (ctx() / 128) as u32, 1)));
-        } else {
-            c.push(of.op("attn_fd", &[(0, a("qr")), (9, kc), (10, vc)], a("att_p"), None, u_att, (2, (ctx() / 128) as u32, ntok)));
-        }
-        c.push(of.op("attn_fd_combine", &[(0, a("att_p"))], a("att"), None, u_att, (16, ntok, 1)));   // same uniform: n, extra, rows
+    if double {
+        c.push(of.op("attn_fd2h", &[(0, a("qr")), (9, kc), (10, vc)], a("att_p"), None, u_att, (2, (ctx() / 256) as u32, 1)));
     } else {
-        c.push(of.op(e, &[(0, a("qr")), (1, kc), (2, vc), (9, kc)], a("att"), None, u_att, (16, ntok, 1)));
+        c.push(of.op("attn_fd", &[(0, a("qr")), (9, kc), (10, vc)], a("att_p"), None, u_att, (2, (ctx() / 128) as u32, 1)));
     }
+    c.push(of.op("attn_fd_combine", &[(0, a("att_p"))], a("att"), None, u_att, (16, ntok, 1)));   // same uniform: n, extra, rows
 }
+/// Merge flag of the double-step attention: its blocks are 256 positions.
+const ATTN2_FLAG: u32 = 256;
 
-/// MECHTA_KERNEL=m1: matvec and routing of M1 (in wgsl/m1/), to compare the versions in M2.
-/// Measurements only: MECHTA_FD_PHASE=1 (attn_fd without the V phase) or 2 (without the K phase). Output wrong.
-/// Prefill: tokens of the lot done in sequence by the same attention workgroup (8, default); MECHTA_ATTN_BATCH=0 for
-/// one workgroup per token (the previous way).
-/// Positions per workgroup of attn_fd4 in the prefill: 64 (default), 128, 256 or 512, MECHTA_PREFILL_BLOCK.
-/// Measured: 256 cuts the merge from 4.3 to 1.2 ms/token at 100K but attn_fd4 grows by 3.9:
-/// no gain, so the default stays 64.
 /// How often a prefill asks whether the client is still there (`prefill_cancellable`).
 pub const KEEPALIVE_EVERY: std::time::Duration = std::time::Duration::from_millis(500);
 
-pub fn prefill_block() -> usize {
-    static B: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    *B.get_or_init(|| match std::env::var("MECHTA_PREFILL_BLOCK").unwrap_or_default().as_str() {
-        "" | "64" => 64, "128" => 128, "256" => 256, "512" => 512,
-        x => panic!("MECHTA_PREFILL_BLOCK={x}: use 64, 128, 256 or 512"),
-    })
-}
-/// Attention of the prefill: `fa` = attn_fa, flash attention on groups of 64 tokens and chunks of
-/// FA_CH positions (blocks of 64 tokens or more; default); `fd4` = attn_fd4 on
-/// lots of 8 tokens (before). MECHTA_PREFILL_ATTN.
+/// Prefill blocks of 32 and 8 tokens: attention with `attn_fd4` (lots of 8 tokens), PREFILL_BLOCK positions per workgroup.
+pub const PREFILL_BLOCK: usize = 64;
+/// Prefill blocks of 64 tokens or more: flash attention on groups of 64 tokens and chunks of FA_CH positions,
+/// `attn_fa_mx` (Q K^T on the matrix units of RDNA 3) with the f16 KV cache, `attn_fa` with the f32 one.
 pub const FA_CH: usize = 2048;   // = FA_CH of ops.wgsl
-/// chunks per dispatch of attn_fa: 8 x 2048 = 16K positions, ~160 ms at 100K (as one lot of attn_fd4 was)
+/// chunks per dispatch of the flash attention: 8 x 2048 = 16K positions, ~160 ms at 100K
 pub const FA_SPLIT: usize = 8;
-/// measuring only: MECHTA_FA_PHASE=1..4 skips one phase of attn_fa (output wrong)
-fn fa_phase() -> u32 { std::env::var("MECHTA_FA_PHASE").ok().and_then(|v| v.parse().ok()).unwrap_or(0) }
 fn fa_splits() -> usize { (ctx() / FA_CH).div_ceil(FA_SPLIT) }
-pub fn prefill_fa() -> bool {
-    static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *F.get_or_init(|| match std::env::var("MECHTA_PREFILL_ATTN").unwrap_or_default().as_str() {
-        "" | "fa" | "mx" | "mx2" => true, "fd4" => false,
-        x => panic!("MECHTA_PREFILL_ATTN={x}: use fa, mx, mx2 or fd4"),
-    })
-}
-/// MECHTA_PREFILL_ATTN=mx: attn_fa_mx, attn_fa with Q K^T on the matrix units
-/// (cooperative matrix, an experimental feature of wgpu asked by crates/gpu). f16 KV cache only.
-/// Default with the f16 KV cache; MECHTA_PREFILL_ATTN=fa for attn_fa. Same choice as crates/gpu.
-pub fn prefill_mx() -> bool {
-    static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *F.get_or_init(mechta_gpu::prefill_mx_requested)
-}
-/// The matrix-unit kernel: attn_fa_mx (QK on the matrix units) or, with MECHTA_PREFILL_ATTN=mx2, attn_fa_mx2 (PV too).
-fn mx_entry() -> &'static str { if std::env::var("MECHTA_PREFILL_ATTN").map(|v| v == "mx2").unwrap_or(false) { "attn_fa_mx2" } else { "attn_fa_mx" } }
+/// The matrix units are used with the f16 KV cache (the same choice as crates/gpu, which asks wgpu for them).
+pub fn prefill_mx() -> bool { kv_format() == KvFormat::F16 }
 /// The source of attn_fa_mx and q_f16: ops.wgsl (f16 KV) + fa_mx.wgsl, with the two enables in front.
 pub fn fa_mx_source() -> String {
     format!("enable f16;\nenable wgpu_cooperative_matrix;\n{}\n{}", ops_source(KvFormat::F16), include_str!("wgsl/fa_mx.wgsl"))
 }
-fn attn_batch() -> u32 { std::env::var("MECHTA_ATTN_BATCH").ok().and_then(|v| v.parse().ok()).unwrap_or(8) }
-/// Double-step attention with blocks of 256 positions: attn_fd2h (default; attn_fd2c before, now
-/// MECHTA_ATTN2=c), or the
-/// variants b256 / d / e; MECHTA_ATTN2=fd2 for attn_fd2 (blocks of 128), =old for attn_fd per token. The merge needs p.flag = 256.
-fn attn2_b256() -> bool { std::env::var("MECHTA_ATTN2").map(|v| v != "fd2" && v != "old").unwrap_or(true) }
-fn attn2_flag() -> u32 { if attn2_b256() { 256 } else { 0 } }
-fn fd_phase() -> u32 { std::env::var("MECHTA_FD_PHASE").ok().and_then(|v| v.parse().ok()).unwrap_or(0) }
-pub fn kernel_m1() -> bool {
-    static M1: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *M1.get_or_init(|| std::env::var("MECHTA_KERNEL").map(|v| v == "m1").unwrap_or(false))
-}
 
-/// Matvec geometry: (threads per row, workgroups x, workgroups y). A row has min(64, k/32)
-/// threads, a workgroup of 64 does 64 / tpr rows; beyond 65535 workgroups it goes onto the y axis.
-pub fn geometry_mv(rows: usize, k: usize) -> (u32, u32, u32) { mv_piece_geometry(rows, k, 32) }
 /// As `geometry_mv`, with pieces of `piece` values (32, or 64 for the Q4_K with double pieces).
 pub fn mv_piece_geometry(rows: usize, k: usize, piece: usize) -> (u32, u32, u32) {
-    if kernel_m1() { return (64, rows.min(65535) as u32, rows.div_ceil(65535) as u32); }
     let tpr = (k / piece).min(64);
     assert!(tpr.is_power_of_two() && k % piece == 0, "k = {k}");
     let groups = rows.div_ceil(64 / tpr);
@@ -272,15 +190,14 @@ pub struct Engine {
     u_pos: Vec<Option<[wgpu::Buffer; 3]>>,
     tab: wgpu::Buffer,
     /// the dispatches of one token, for even [0] and odd [1] position; `end_layer[il]` = index after layer il
-    prog: [Vec<Command>; 2], end_layer: Vec<usize>,
-    pub byte_gpu: u64,
+    prog: [Vec<Command>; 2],
     /// Measurements (M2): None = no measurement, the normal path.
     /// MTP layer (M4): program of one draft, segment signatures (after eh_proj, attention, MoE, final norm, logits),
     /// its own RoPE table (position + 1). The position uniforms are u_pos[N_LAYER].
-    prog_mtp: Vec<Command>, pub end_mtp: Vec<usize>, m_tab: wgpu::Buffer,
+    prog_mtp: Vec<Command>, m_tab: wgpu::Buffer,
     /// Double step (M4): program for 2 tokens (per conv parity), end of each layer, DeltaNet state after the
     /// first token, RoPE tables of the 2 tokens, position uniforms for 2 tokens.
-    prog2: [Vec<Command>; 2], pub end2: Vec<usize>, ssm1: Vec<wgpu::Buffer>, conv1: Vec<wgpu::Buffer>, tab2: wgpu::Buffer, u_pos2: Vec<Option<[wgpu::Buffer; 3]>>,
+    prog2: [Vec<Command>; 2], ssm1: Vec<wgpu::Buffer>, conv1: Vec<wgpu::Buffer>, tab2: wgpu::Buffer, u_pos2: Vec<Option<[wgpu::Buffer; 3]>>,
     /// 2-token MTP (MTP cycle: after an accepted draft the MTP cache must receive the two new tokens); parity
     /// used by the last double step (to know which conv state to restore on rejection)
     prog_mtp2: Vec<Command>, last_par: std::cell::Cell<usize>,
@@ -290,7 +207,7 @@ pub struct Engine {
     /// (conv_n, delta_n, routing), position uniforms per attention layer (rope K, copy V, attention in lots of 8),
     /// program per conv parity.
     ap: HashMap<&'static str, wgpu::Buffer>, tab_n: wgpu::Buffer, u_n: [wgpu::Buffer; 3],
-    u_pos_n: Vec<Option<(wgpu::Buffer, wgpu::Buffer, Vec<wgpu::Buffer>)>>, prog_n: Vec<[Vec<Command>; 2]>, end_n: Vec<Vec<usize>>,
+    u_pos_n: Vec<Option<(wgpu::Buffer, wgpu::Buffer, Vec<wgpu::Buffer>)>>, prog_n: Vec<[Vec<Command>; 2]>,
     /// Where the prefill splits its submits: the layer ends of `end_n` plus cuts inside the attention (see `attn_cuts`)
     cuts_n: Vec<Vec<usize>>,
     /// First position of the MTP layer's KV cache that the MTP attention looks at (default 1). The Session
@@ -315,8 +232,8 @@ struct Factory<'a> {
     mv: HashMap<&'static str, wgpu::ComputePipeline>, op: HashMap<&'static str, wgpu::ComputePipeline>,
     /// M4: n-column matvec (matvec_n4.wgsl) and routing of the second token
     mvn: HashMap<&'static str, wgpu::ComputePipeline>, rt2: wgpu::ComputePipeline,
-    /// M4: experts in union (matvec_u.wgsl) and the kernel that computes the union
-    mvu: HashMap<&'static str, wgpu::ComputePipeline>, un: wgpu::ComputePipeline,
+    /// M4: the kernel that computes the union of the experts of the double step
+    un: wgpu::ComputePipeline,
     /// M4: x in f16 in the double step: 2-column matvec (matvec_nh) and experts in union (matvec_uh)
     mvh: HashMap<&'static str, wgpu::ComputePipeline>, mvuh: HashMap<&'static str, wgpu::ComputePipeline>,
     /// F32 of matvec4 (with x_off): the engine's `mv_f32` comes from matvec.wgsl, which does NOT have x_off (a past bug: mtp2 19/27)
@@ -347,10 +264,9 @@ impl Factory<'_> {
         let t = self.g.tensor(name).unwrap_or_else(|| panic!("{name}"));
         let k = t.dims[0] as usize; let rows = *t.dims.get(1).unwrap_or(&1) as usize;
         assert!(!name.contains("_exps"));
-        // tile 128 x 64 (gemm2, default); MECHTA_GEMM_DENSE=old for the 64 x 64 tile (gemm)
-        let old = std::env::var("MECHTA_GEMM_DENSE").map(|v| v == "old").unwrap_or(false);
-        let suf = match t.ttype { TType::Q8_0 => "q8_0", TType::Q4_K => "q4_k", TType::Q6_K => "q6_k", TType::F32 | TType::BF16 => "f32", x => panic!("{x:?}") };
-        let (e, bm): (&'static str, usize) = if old { (Box::leak(format!("gemm_{suf}").into_boxed_str()), 64) } else { (Box::leak(format!("gemm2_{suf}").into_boxed_str()), 128) };
+        // tile 128 x 64 (gemm2)
+        let e = match t.ttype { TType::Q8_0 => "gemm2_q8_0", TType::Q4_K => "gemm2_q4_k", TType::Q6_K => "gemm2_q6_k", TType::F32 | TType::BF16 => "gemm2_f32", x => panic!("{x:?}") };
+        let bm = 128;
         let u = self.u([rows as u32, k as u32, 0, 0, 0, 0, nb as u32, k as u32]);
         let byte = if t.ttype == TType::BF16 { 2 * t.nbytes } else { t.nbytes };
         self.gpu.command(&self.gm[e], &[(0, &self.w[name]), (1, self.a(x)), (2, self.a(y)), (3, &self.local_ids), (4, &u)], ((rows as u32).div_ceil(bm as u32), (nb as u32).div_ceil(64), 1), format!("{} x{nb}", short(name)), byte)
@@ -360,16 +276,10 @@ impl Factory<'_> {
     fn gemm_e(&self, name: &str, x: &str, y: &str, x_step: u32, x_tok: u32, nb: usize) -> Command {
         let t = self.g.tensor(name).unwrap_or_else(|| panic!("{name}"));
         let k = t.dims[0] as usize; let rows = *t.dims.get(1).unwrap_or(&1) as usize;
-        // weights in registers, 2 rows per thread (gemmr5, default); MECHTA_GEMM_EXPERTS=r (1 row), tile16, narrow, wide
-        let var = std::env::var("MECHTA_GEMM_EXPERTS").unwrap_or_default();
-        let (pre, bn) = match var.as_str() { "wide" => ("gemm", 64), "narrow" => ("gemm8", 8), "tile16" => ("gemm16", 16), "r" => ("gemmr", 16), _ => ("gemmr5", 16) };
-        let suf = match t.ttype { TType::Q4_K => "q4_k", TType::Q6_K => "q6_k", TType::Q8_0 => "q8_0", TType::Q3_K => "q3_k", x => panic!("{x:?}") };
-        // Q3_K only with the default expert GEMM (gemmr5)
-        if t.ttype == TType::Q3_K { assert_eq!(pre, "gemmr5", "{name}: Q3_K experts need the default MECHTA_GEMM_EXPERTS"); }
-        let e: &'static str = Box::leak(format!("{pre}_{suf}").into_boxed_str());
-        let bm = if pre == "gemm16" || pre == "gemmr5" { 128 } else { 64 };
-        let phase: u32 = std::env::var("MECHTA_GEMM_PHASE").ok().and_then(|v| v.parse().ok()).unwrap_or(0);   // measurements only, output wrong
-        let u = self.u([rows as u32, k as u32, phase, 2, x_step, 0, nb as u32, x_tok]);
+        // weights in registers, 2 rows per thread (gemmr5), tiles of 128 rows x 16 tokens
+        let e = match t.ttype { TType::Q4_K => "gemmr5_q4_k", TType::Q6_K => "gemmr5_q6_k", TType::Q8_0 => "gemmr5_q8_0", TType::Q3_K => "gemmr5_q3_k", x => panic!("{x:?}") };
+        let (bm, bn) = (128u32, 16);
+        let u = self.u([rows as u32, k as u32, 0, 2, x_step, 0, nb as u32, x_tok]);
         let ny = (nb as u32).div_ceil(bn as u32);
         self.gpu.command(&self.gm[e], &[(0, &self.w[name]), (1, self.a(x)), (2, self.a(y)), (3, self.a("grp")), (4, &u)], ((rows as u32).div_ceil(bm), ny, 256), format!("experts {} x{nb}", short(name)), t.nbytes)
     }
@@ -418,18 +328,15 @@ impl Factory<'_> {
         c.push(self.op("argmax1", &[(0, a("logits"))], a("am_v"), Some(a("am_i")), &u_am1, (g, 1, 1)));
         c.push(self.op("argmax2", &[(0, a("am_v")), (1, a("am_i"))], a("am"), Some(a("am2")), &u_am2, (1, 1, 1)));
     }
-    /// M4: expert matvec in union for the double step (see matvec_u.wgsl). x_tok/y_tok = stride per token.
-    fn mv_u(&self, name: &str, x: &str, y: &str, x_step: u32, x_tok: u32) -> Command { self.mv_u_(name, x, y, x_step, x_tok, false) }
-    fn mv_uh(&self, name: &str, x: &str, y: &str, x_step: u32, x_tok: u32) -> Command { self.mv_u_(name, x, y, x_step, x_tok, true) }
-    fn mv_u_(&self, name: &str, x: &str, y: &str, x_step: u32, x_tok: u32, f16: bool) -> Command {
+    fn mv_uh(&self, name: &str, x: &str, y: &str, x_step: u32, x_tok: u32) -> Command {
         let t = self.g.tensor(name).unwrap_or_else(|| panic!("{name}"));
         let k = t.dims[0] as usize; let rows = *t.dims.get(1).unwrap_or(&1) as usize;
         let e = match t.ttype { TType::Q4_K => "mv_q4_k", TType::Q6_K => "mv_q6_k", TType::Q3_K => "mv_q3_k", TType::Q8_0 => "mv_q8_0", x => panic!("{name}: {x:?}") };
         let (tpr, nx, ny) = mv_piece_geometry(rows, k, 32);
         let u = self.u([rows as u32, k as u32, nx, 8 * rows as u32, x_step, tpr, 2, x_tok]);
-        let p = if f16 { &self.mvuh[e] } else { &self.mvu[e] };
+        let p = &self.mvuh[e];
         // bytes: ~14 experts of 16 on average (2.2 in common): only for the GB/s of the profile
-        self.gpu.command(p, &[(0, &self.w[name]), (1, self.a(x)), (2, self.a(y)), (3, self.a("uniforms")), (4, &u)], (nx, ny, 16), format!("experts {} ({e}) union{}", short(name), if f16 { " h" } else { "" }), 14 * t.nbytes / 256)
+        self.gpu.command(p, &[(0, &self.w[name]), (1, self.a(x)), (2, self.a(y)), (3, self.a("uniforms")), (4, &u)], (nx, ny, 16), format!("experts {} ({e}) union h", short(name)), 14 * t.nbytes / 256)
     }
     /// M4: expert matvec for token `tok` of the double step: x of the token at `x_off`, output at `y_off`, experts from `ids`.
     fn mv_tok(&self, name: &str, x: &str, y: &str, x_step: u32, x_off: u32, y_off: u32, ids: &str) -> Command {
@@ -445,10 +352,8 @@ impl Factory<'_> {
         let t = self.g.tensor(name).unwrap_or_else(|| panic!("{name}"));
         let k = t.dims[0] as usize; let rows = *t.dims.get(1).unwrap_or(&1) as usize;
         let experts = name.contains("_exps");
-        let mut e = match t.ttype { TType::Q8_0 => "mv_q8_0", TType::Q4_K => "mv_q4_k", TType::Q6_K => "mv_q6_k", TType::Q3_K => "mv_q3_k", TType::F32 | TType::BF16 => "mv_f32", x => panic!("{x:?}") };
-        let mut piece = 32;
-        if t.ttype == TType::Q4_K && q4k_64() { e = "mv_q4_k64"; piece = 64; }
-        let (tpr, nx, ny) = mv_piece_geometry(rows, k, piece);
+        let e = match t.ttype { TType::Q8_0 => "mv_q8_0", TType::Q4_K => "mv_q4_k", TType::Q6_K => "mv_q6_k", TType::Q3_K => "mv_q3_k", TType::F32 | TType::BF16 => "mv_f32", x => panic!("{x:?}") };
+        let (tpr, nx, ny) = mv_piece_geometry(rows, k, 32);
         let u = self.u([rows as u32, k as u32, nx, experts as u32, x_step, tpr, 0, 0]);
         let ids = if experts { self.a("ids") } else { &self.local_ids };
         let nb = if t.ttype == TType::BF16 { 2 * t.nbytes } else { t.nbytes };   // BF16 is converted to F32
@@ -466,54 +371,29 @@ impl Engine {
         // MemoryUsage: with the default (Performance) a 150 MiB buffer takes a 256 MiB block
         // (measured with `mechta memtest`): 32 GB for the experts alone instead of 19.
         let gpu = Gpu::with_memory(wgpu::MemoryHints::MemoryUsage);
-        let src_mv = if kernel_m1() { include_str!("wgsl/m1/matvec.wgsl") } else { include_str!("wgsl/matvec.wgsl") };
         let src_op_s = ops_source(kv_format()); let src_op = src_op_s.as_str();
-        // Matvec: Q8_0, Q4_K and Q6_K from matvec4.wgsl (x as vec4; Q4_K: d1 (q . x) - m1 sum x, 46 → 62 GB/s
-        // in the engine; Q8_0 and Q6_K: realigned words + unpack4xI8/U8, at the read ceiling of 81-83 GB/s on the bench).
-        // F32 from matvec.wgsl. MECHTA_MATVEC, only for comparisons: base = everything from matvec.wgsl; q4k3 = Q4_K from matvec3
-        // and the rest from matvec; q8 = Q8_0 and Q4_K from matvec4, Q6_K from matvec (the default before the new Q6_K);
-        // mixed = Q8_0 and Q4_K from matvec2 (4-byte words; it is not faster).
-        let choice = std::env::var("MECHTA_MATVEC").unwrap_or_default();
-        let src_mv2 = include_str!("wgsl/matvec2.wgsl");
-        let src_mv3 = include_str!("wgsl/matvec3.wgsl");
+        // Matvec: Q8_0, Q4_K, Q6_K and Q3_K from matvec4.wgsl (x as vec4; Q4_K: d1 (q . x) - m1 sum x; Q8_0 and Q6_K:
+        // realigned words + unpack4xI8/U8, at the read ceiling of 81-83 GB/s). F32 from matvec.wgsl.
         let src_mv4_s = q3_source("matvec4"); let src_mv4 = src_mv4_s.as_str();
-        let mv = ["mv_q8_0", "mv_q4_k", "mv_q6_k", "mv_f32", "mv_q4_k64", "mv_q3_k"].into_iter().map(|e| {
-            let src = match choice.as_str() {
-                _ if e == "mv_q4_k64" || e == "mv_q3_k" => src_mv4,
-                "base" => src_mv,
-                "q4k3" if e == "mv_q4_k" => src_mv3,
-                "q4k3" => src_mv,
-                "mixed" if e == "mv_q8_0" || e == "mv_q4_k" => src_mv2,
-                "q8" if e == "mv_q8_0" || e == "mv_q4_k" => src_mv4,
-                "q8" => src_mv,
-                _ if e != "mv_f32" && !kernel_m1() => src_mv4,
-                _ => src_mv,
-            };
-            (e, gpu.pipeline(src, e))
-        }).collect();
-        if !choice.is_empty() { eprintln!("matvec: MECHTA_MATVEC={choice}"); }
-        // MECHTA_DELTA=v1: the old delta (state as ggml, two passes), only for comparisons.
-        let delta_v1 = std::env::var("MECHTA_DELTA").map(|v| v == "v1").unwrap_or(false);
-        if delta_v1 { eprintln!("delta: MECHTA_DELTA=v1"); }
-        let op = ["rmsnorm", "conv", "beta_gate", "delta", "sum", "swiglu", "moe_sum", "rope", "attn", "attn_gate", "copy", "argmax1", "argmax2",
-                  "beta_gate2", "conv2", "delta2", "rope2", "attn2", "swiglu16", "attn_gate16", "attn_v2", "attn2_v2", "attn_v3", "attn2_v3", "attn_fd", "attn_fd_combine", "conv_n", "delta_n", "attn_fd4", "attn_fa", "attn_fd2", "attn_fd2b", "attn_fd2c", "attn_fd2d", "attn_fd2e", "attn_fd2_read", "attn_fd2_read2", "attn_fd2f", "attn_fd2g", "attn_fd2cm", "attn_fd2h", "attn_fd2i"].into_iter()
-            .chain(if matches!(kv_format(), KvFormat::F32 | KvFormat::F16Sim) { vec![] } else { vec!["kv_rope", "kv_rope2", "kv_copy"] })
-            .map(|e| (e, gpu.pipeline(src_op, if e == "delta" && delta_v1 { "delta1" } else { e }))).collect::<HashMap<_, _>>();
+        let mv = ["mv_q8_0", "mv_q4_k", "mv_q6_k", "mv_f32", "mv_q3_k"].into_iter()
+            .map(|e| (e, gpu.pipeline(if e == "mv_f32" { include_str!("wgsl/matvec.wgsl") } else { src_mv4 }, e))).collect();
+        let op = ["rmsnorm", "conv", "beta_gate", "delta", "sum", "swiglu", "moe_sum", "rope", "attn_gate", "copy", "argmax1", "argmax2",
+                  "beta_gate2", "conv2", "delta2", "rope2", "swiglu16", "attn_gate16", "attn_fd", "attn_fd_combine", "conv_n", "delta_n",
+                  "attn_fd4", "attn_fa", "attn_fd2h"].into_iter()
+            .chain(if kv_format() == KvFormat::F32 { vec![] } else { vec!["kv_rope", "kv_rope2", "kv_copy"] })
+            .map(|e| (e, gpu.pipeline(src_op, e))).collect::<HashMap<_, _>>();
         let mut op = op;
         if prefill_mx() {
-            assert!(kv_format() == KvFormat::F16, "MECHTA_PREFILL_ATTN=mx needs MECHTA_KV=f16");
             let src_mx = fa_mx_source();
-            for e in [mx_entry(), "q_f16"] { op.insert(e, gpu.pipeline(&src_mx, e)); }
-            eprintln!("prefill attention: {} (matrix units)", mx_entry());
+            for e in ["attn_fa_mx", "q_f16"] { op.insert(e, gpu.pipeline(&src_mx, e)); }
+            eprintln!("prefill attention: attn_fa_mx (matrix units)");
         }
-        let rt = gpu.pipeline(if kernel_m1() { include_str!("wgsl/m1/routing.wgsl") } else { include_str!("wgsl/routing.wgsl") }, "routing");
-        let rt2 = gpu.pipeline(if kernel_m1() { include_str!("wgsl/m1/routing.wgsl") } else { include_str!("wgsl/routing.wgsl") }, "routing_b");
-        let src_mvu = q3_source("matvec_u");
-        let mvu = ["mv_q4_k", "mv_q6_k", "mv_q3_k", "mv_q8_0"].into_iter().map(|e| (e, gpu.pipeline(&src_mvu, e))).collect();
+        let rt = gpu.pipeline(include_str!("wgsl/routing.wgsl"), "routing");
+        let rt2 = gpu.pipeline(include_str!("wgsl/routing.wgsl"), "routing_b");
         let un = gpu.pipeline(include_str!("wgsl/merge.wgsl"), "merge");
         // M3: prefill GEMM, per-token routing, grouping by expert
         let src_gm_q3 = q3_source("gemm"); let src_gm = src_gm_q3.as_str();
-        let gm = ["gemm_q8_0", "gemm_q4_k", "gemm_q6_k", "gemm_f32", "gemm8_q8_0", "gemm8_q4_k", "gemm8_q6_k", "gemm16_q8_0", "gemm16_q4_k", "gemm16_q6_k", "gemmr_q8_0", "gemmr_q4_k", "gemmr_q6_k", "gemmr5_q8_0", "gemmr5_q4_k", "gemmr5_q6_k", "gemm2_q8_0", "gemm2_q4_k", "gemm2_q6_k", "gemm2_f32", "gemmr5_q3_k"].into_iter().map(|e| (e, gpu.pipeline(src_gm, e))).collect();
+        let gm = ["gemmr5_q8_0", "gemmr5_q4_k", "gemmr5_q6_k", "gemmr5_q3_k", "gemm2_q8_0", "gemm2_q4_k", "gemm2_q6_k", "gemm2_f32"].into_iter().map(|e| (e, gpu.pipeline(src_gm, e))).collect();
         let rtn = gpu.pipeline(include_str!("wgsl/routing.wgsl"), "routing_n");
         let rg = gpu.pipeline(include_str!("wgsl/routing.wgsl"), "gather");
         let mv4_f32 = gpu.pipeline(src_mv4, "mv_f32");
@@ -525,10 +405,8 @@ impl Engine {
         let mvn = ["mv_q8_0", "mv_q4_k", "mv_q6_k", "mv_f32"].into_iter().map(|e| (e, gpu.pipeline(src_mvn, e))).collect();
         let (emb_e, emb_row, emb_bpr) = emb_format(&g);
         let dq = gpu.pipeline(include_str!("wgsl/dequant.wgsl"), emb_e);
-        // Trial with 16 GB of VRAM. Normal order: first the buffers the GPU WRITES (states, KV cache,
-        // outputs, ~0.11 GB), while the VRAM is still empty, so they end up in VRAM; then, with MECHTA_RESERVE_GB=N,
-        // a reserve of N GB during weight loading, freed afterwards. With MECHTA_ORDER=weights-first the old
-        // order: weights first, written buffers after (with VRAM full they end up in GTT). Used to separate the two causes.
+        // Order: first the buffers the GPU WRITES (states, KV cache, outputs, ~0.11 GB), while the VRAM is still empty,
+        // so they end up in VRAM; then, with MECHTA_RESERVE_GB=N, a reserve of N GB during weight loading, freed afterwards.
         let create_buffer = || {
         let mut a = HashMap::new();
         // sizes for TWO tokens (M4, double step): token t is at t * single size
@@ -551,7 +429,7 @@ impl Engine {
                        ("qr", NB * 4096), ("qh", NB * 2048), ("att", NB * 4096), ("ag", NB * 4096), ("lg", NB * 256), ("probs", NB * 256), ("ids", NB * 8), ("weights", NB * 8),
                        ("grp", 512 + NB * 8), ("eg", NB * 8 * 512), ("eu", NB * 8 * 512), ("esw", NB * 8 * 512), ("ed", NB * 8 * 2048),
                        ("sg", NB * 512), ("su", NB * 512), ("ssw", NB * 512), ("sd", NB * 2048), ("sgt", NB), ("emb_raw", NB * 544),
-                       ("att_p", (8 * 16 * (ctx() / prefill_block())).max(64 * 16 * (ctx() / FA_CH)) * 258)] {   // attention in lots of 8 tokens (attn_fd4: blocks of prefill_block())
+                       ("att_p", (8 * 16 * (ctx() / PREFILL_BLOCK)).max(64 * 16 * (ctx() / FA_CH)) * 258)] {   // partials of attn_fd4 (lots of 8 tokens) or of the flash attention
             ap.insert(n, gpu.empty_buffer(n, k as u64 * 4));
         }
         let tab_n = gpu.empty_buffer("rope-n", (NB * 64 * 4) as u64);
@@ -615,7 +493,7 @@ impl Engine {
             gpu.queue.submit([]);
             gpu.device.poll(wgpu::PollType::wait_indefinitely()).expect("poll");
             // safety: GPU memory must not grow more than the weights + 3 GB
-            let (v1, g1) = crate::profile::gpu_memory();
+            let (v1, g1) = crate::tools::gpu_memory();
             let grown = (v1 - base.0) + (g1 - base.1);
             assert!(grown < byte_gpu as f64 / 1e9 + 3.0, "GPU memory grew {grown:.2} GB for {:.2} GB of weights: stopping", byte_gpu as f64 / 1e9);
         }
@@ -632,41 +510,30 @@ impl Engine {
             }
             (w, byte_gpu)
         };
-        let weights_before = std::env::var("MECHTA_ORDER").map(|v| v == "weights-first").unwrap_or(false);
-        let mem0 = crate::profile::gpu_memory();
-        let ((a, tab, m_tab, conv, ssm, kc, vc, u_pos, tab2, ssm1, conv1, u_pos2, ap, tab_n, u_n, u_pos_n), (w, byte_gpu)) = if weights_before {
-            let (w, byte_gpu) = load_weights(mem0);
-            let mem1 = crate::profile::gpu_memory();
-            eprintln!("order pesi-prima · weights {:.2} GB: VRAM +{:.2} GTT +{:.2} GB", byte_gpu as f64 / 1e9, mem1.0 - mem0.0, mem1.1 - mem0.1);
-            let b = create_buffer();
-            let mem2 = crate::profile::gpu_memory();
-            eprintln!("buffers written by the GPU: VRAM +{:.3} GTT +{:.3} GB", mem2.0 - mem1.0, mem2.1 - mem1.1);
-            (b, (w, byte_gpu))
-        } else {
-            let b = create_buffer();
-            let mem1 = crate::profile::gpu_memory();
-            eprintln!("buffers written by the GPU: VRAM +{:.3} GTT +{:.3} GB", mem1.0 - mem0.0, mem1.1 - mem0.1);
-            let reserve_gb: u64 = reserve.unwrap_or_else(|| std::env::var("MECHTA_RESERVE_GB").ok().and_then(|v| v.parse().ok()).unwrap_or(0));
-            let reserve: Vec<wgpu::Buffer> = (0..reserve_gb * 4).map(|_| gpu.empty_buffer("reserve", 256 << 20)).collect();
-            let mem2 = crate::profile::gpu_memory();
-            if reserve_gb > 0 { eprintln!("reserve {reserve_gb} GB: VRAM +{:.2} GTT +{:.2} GB", mem2.0 - mem1.0, mem2.1 - mem1.1); }
-            let (w, byte_gpu) = load_weights(mem2);
-            let mem3 = crate::profile::gpu_memory();
-            eprintln!("weights {:.2} GB: VRAM +{:.2} GTT +{:.2} GB", byte_gpu as f64 / 1e9, mem3.0 - mem2.0, mem3.1 - mem2.1);
-            drop(reserve);
-            gpu.queue.submit([]); gpu.device.poll(wgpu::PollType::wait_indefinitely()).expect("poll");
-            let mem4 = crate::profile::gpu_memory();
-            if reserve_gb > 0 { eprintln!("reserve released: VRAM in use {:.2} GB, GTT in use {:.2} GB", mem4.0, mem4.1); }
-            (b, (w, byte_gpu))
-        };
+        let mem0 = crate::tools::gpu_memory();
+        let b = create_buffer();
+        let mem1 = crate::tools::gpu_memory();
+        eprintln!("buffers written by the GPU: VRAM +{:.3} GTT +{:.3} GB", mem1.0 - mem0.0, mem1.1 - mem0.1);
+        let reserve_gb: u64 = reserve.unwrap_or_else(|| std::env::var("MECHTA_RESERVE_GB").ok().and_then(|v| v.parse().ok()).unwrap_or(0));
+        let reserve: Vec<wgpu::Buffer> = (0..reserve_gb * 4).map(|_| gpu.empty_buffer("reserve", 256 << 20)).collect();
+        let mem2 = crate::tools::gpu_memory();
+        if reserve_gb > 0 { eprintln!("reserve {reserve_gb} GB: VRAM +{:.2} GTT +{:.2} GB", mem2.0 - mem1.0, mem2.1 - mem1.1); }
+        let (w, byte_gpu) = load_weights(mem2);
+        let mem3 = crate::tools::gpu_memory();
+        eprintln!("weights {:.2} GB: VRAM +{:.2} GTT +{:.2} GB", byte_gpu as f64 / 1e9, mem3.0 - mem2.0, mem3.1 - mem2.1);
+        drop(reserve);
+        gpu.queue.submit([]); gpu.device.poll(wgpu::PollType::wait_indefinitely()).expect("poll");
+        let mem4 = crate::tools::gpu_memory();
+        if reserve_gb > 0 { eprintln!("reserve released: VRAM in use {:.2} GB, GTT in use {:.2} GB", mem4.0, mem4.1); }
+        let (a, tab, m_tab, conv, ssm, kc, vc, u_pos, tab2, ssm1, conv1, u_pos2, ap, tab_n, u_n, u_pos_n) = b;
         let empty = gpu.empty_buffer("vuoto", 4);
         let local_ids = gpu.buffer_u32("id_locali", &[0, 1, 2, 3, 4, 5, 6, 7]);
-        let (prog, end_layer, pm, fm, prog2, end2, pm2, prog_n, end_n) = {
-            let of = Factory { gpu: &gpu, g: &g, mv, op, mvn, rt2, mvu, un, mvh, mvuh, mv4_f32, head_k: head_ids.len(), rt, dq, emb_bpr, w, a: &a, empty, local_ids, gm, rtn, rg };
-            let (p0, f) = program(&of, 0, &conv, &ssm, &kc, &vc, &u_pos, &tab);
+        let (prog, pm, prog2, pm2, prog_n, end_n) = {
+            let of = Factory { gpu: &gpu, g: &g, mv, op, mvn, rt2, un, mvh, mvuh, mv4_f32, head_k: head_ids.len(), rt, dq, emb_bpr, w, a: &a, empty, local_ids, gm, rtn, rg };
+            let (p0, _) = program(&of, 0, &conv, &ssm, &kc, &vc, &u_pos, &tab);
             let (p1, _) = program(&of, 1, &conv, &ssm, &kc, &vc, &u_pos, &tab);
-            let (pm, fm) = if with_mtp { program_mtp(&of, &conv, &ssm, &kc, &vc, &u_pos, &m_tab) } else { (vec![], vec![]) };
-            let (d0, f2) = program2(&of, 0, &conv, &conv1, &ssm, &ssm1, &kc, &vc, &u_pos2, &tab2);
+            let pm = if with_mtp { program_mtp(&of, &conv, &ssm, &kc, &vc, &u_pos, &m_tab).0 } else { vec![] };
+            let (d0, _) = program2(&of, 0, &conv, &conv1, &ssm, &ssm1, &kc, &vc, &u_pos2, &tab2);
             let (d1, _) = program2(&of, 1, &conv, &conv1, &ssm, &ssm1, &kc, &vc, &u_pos2, &tab2);
             let pm2 = if with_mtp { program_mtp2(&of, &conv, &conv1, &ssm, &ssm1, &kc, &vc, &u_pos2, &tab2) } else { vec![] };
             // M3: the prefill program uses the `ap` buffers (same names): the same factory with the map swapped
@@ -681,10 +548,10 @@ impl Engine {
                 let (n1, _) = program_n(&ofn, 1, &conv, &ssm, &kc, &vc, &u_n, &u_pos_n, &tab_n, nb);
                 prog_n.push([n0, n1]); fn_.push(f0);
             }
-            ([p0, p1], f, pm, fm, [d0, d1], f2, pm2, prog_n, fn_)
+            ([p0, p1], pm, [d0, d1], pm2, prog_n, fn_)
         };
-        Engine { g, gpu, emb_row, a, conv, ssm, u_pos, tab, prog, end_layer, byte_gpu, prog_mtp: pm, end_mtp: fm, m_tab, prog2, end2, ssm1, conv1, tab2, u_pos2, prog_mtp2: pm2,
-                 ap, tab_n, u_n, u_pos_n, cuts_n: (0..BLOCKS.len()).map(|ib| attn_cuts(&prog_n[ib][0], &end_n[ib])).collect(), prog_n, end_n, last_par: std::cell::Cell::new(0), head_ids, par: std::cell::Cell::new(0), mtp_start: std::cell::Cell::new(1), photo: RefCell::new(vec![]), kv_buf: (kc, vc), prof: RefCell::new(None), span: RefCell::new(None) }
+        Engine { g, gpu, emb_row, a, conv, ssm, u_pos, tab, prog, prog_mtp: pm, m_tab, prog2, ssm1, conv1, tab2, u_pos2, prog_mtp2: pm2,
+                 ap, tab_n, u_n, u_pos_n, cuts_n: (0..BLOCKS.len()).map(|ib| attn_cuts(&prog_n[ib][0], &end_n[ib])).collect(), prog_n, last_par: std::cell::Cell::new(0), head_ids, par: std::cell::Cell::new(0), mtp_start: std::cell::Cell::new(1), photo: RefCell::new(vec![]), kv_buf: (kc, vc), prof: RefCell::new(None), span: RefCell::new(None) }
     }
 
     /// Resets the states (conv, DeltaNet) for a new sequence. The KV cache gets overwritten.
@@ -696,30 +563,6 @@ impl Engine {
         } }
     }
 
-    /// One token at position `pos`. Returns the logits. With `l_out`, x is read at the end of every layer
-    /// (one submit per layer: only for the verifications).
-    pub fn token(&self, tok: u32, pos: usize, l_out: Option<&mut dyn FnMut(usize, Vec<f32>)>) -> Vec<f32> {
-        assert!(pos < ctx());
-        self.inputs(tok, pos);
-        let prog = &self.prog[self.par.get()]; self.par.set(1 - self.par.get());
-        match l_out {
-            None => self.run(prog),
-            Some(f) => {
-                let mut s = 0;
-                for il in 0..N_LAYER {
-                    let e = self.end_layer[il];
-                    self.run(&prog[s..e]);
-                    f(il, self.gpu.read_f32(&self.a["x"], 2048));
-                    s = e;
-                }
-                self.run(&prog[s..]);
-            }
-        }
-        let tc = Instant::now();
-        let v = self.gpu.read_f32(&self.a["logits"], VOCAB);
-        self.cpu("logit read (1 MB)", tc);
-        v
-    }
 
     /// The inputs of one token: embedding row (from the file, in page cache), RoPE table, position uniforms.
     fn inputs(&self, tok: u32, pos: usize) {
@@ -733,7 +576,7 @@ impl Engine {
         for u in self.u_pos[..N_LAYER].iter().flatten() {
             self.gpu.write(&u[0], 0, &ub([256, 2, 0, 0, 256, 256, 0, (pos * 512) as u32]));
             self.gpu.write(&u[1], 0, &ub([512, 0, 0, 0, 0, 0, 0, (pos * 512) as u32]));
-            self.gpu.write(&u[2], 0, &ub([pos as u32 + 1, (ctx() / 128) as u32, fb(1.0 / 16.0), fd_phase(), 0, 0, 0, 0]));
+            self.gpu.write(&u[2], 0, &ub([pos as u32 + 1, (ctx() / 128) as u32, fb(1.0 / 16.0), 0, 0, 0, 0, 0]));
         }
         self.cpu("inputs (embedding, RoPE, uniform)", tc);
     }
@@ -750,20 +593,9 @@ impl Engine {
         let u = self.u_pos[N_LAYER].as_ref().expect("MTP layer not loaded");
         self.gpu.write(&u[0], 0, &ub([256, 2, 0, 0, 256, 256, 0, (pos * 512) as u32]));
         self.gpu.write(&u[1], 0, &ub([512, 0, 0, 0, 0, 0, 0, (pos * 512) as u32]));
-        self.gpu.write(&u[2], 0, &ub([pos as u32 + 1, (ctx() / 128) as u32, fb(1.0 / 16.0), fd_phase(), 0, 0, 0, self.mtp_start.get()]));
+        self.gpu.write(&u[2], 0, &ub([pos as u32 + 1, (ctx() / 128) as u32, fb(1.0 / 16.0), 0, 0, 0, 0, self.mtp_start.get()]));
     }
 
-    /// An MTP draft for the verifications: h = h_nextn (2048 f32) written into "xn", then the segmented program; after each
-    /// segment `f(segment)` can read the buffers ("x", "x2", "xn", "logits" with `read`). Returns the GPU argmax.
-    pub fn draft_verify(&self, h: &[f32], tok: u32, pos: usize, f: &mut dyn FnMut(usize)) -> u32 {
-        assert_eq!(h.len(), 2048);
-        self.gpu.write(&self.a["xn"], 0, &h.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>());
-        self.inputs_mtp(tok, pos);
-        let mut s = 0;
-        for (k, &e) in self.end_mtp.iter().enumerate() { self.gpu.run_commands(&self.prog_mtp[s..e]); f(k); s = e; }
-        self.gpu.run_commands(&self.prog_mtp[s..]);
-        self.argmax_gpu().0
-    }
 
     /// Inputs of the double step: embedding rows of the 2 tokens (in a row in emb_raw), RoPE tables of pos and pos+1,
     /// position uniforms for 2 tokens (K/V written at pos and pos+1; attention up to pos+tok).
@@ -780,21 +612,10 @@ impl Engine {
         for u in self.u_pos2[..N_LAYER].iter().flatten() {
             self.gpu.write(&u[0], 0, &ub([256, 4, 0, 0, 256, 256, 2, (pos * 512) as u32]));      // rope2 of K: 2 rows (KV heads) per token
             self.gpu.write(&u[1], 0, &ub([1024, 0, 0, 0, 0, 0, 0, (pos * 512) as u32]));
-            self.gpu.write(&u[2], 0, &ub([pos as u32 + 1, (ctx() / 128) as u32, fb(1.0 / 16.0), fd_phase(), 0, 0, attn2_flag(), 0]));
+            self.gpu.write(&u[2], 0, &ub([pos as u32 + 1, (ctx() / 128) as u32, fb(1.0 / 16.0), 0, 0, 0, ATTN2_FLAG, 0]));
         }
     }
 
-    /// Double step for the verifications: token tok0 at `pos` and tok1 at `pos + 1`, segmented program (one per layer):
-    /// after layer `il` it calls `f(il)`, which can read "x" = [l_out tok0 | l_out tok1]. Returns the argmax of the two tokens.
-    pub fn step2_verify(&self, tok0: u32, tok1: u32, pos: usize, f: &mut dyn FnMut(usize)) -> (u32, u32) {
-        self.inputs2(tok0, tok1, pos);
-        let prog = &self.prog2[self.par.get()]; self.par.set(1 - self.par.get());
-        let mut s = 0;
-        for (il, &e) in self.end2.iter().enumerate() { self.gpu.run_commands(&prog[s..e]); f(il); s = e; }
-        self.gpu.run_commands(&prog[s..]);
-        let i = self.gpu.read_f32(&self.a["am2"], 2);
-        (i[0].to_bits(), i[1].to_bits())
-    }
 
     /// Fast double step (M4): one submit, reading back the two argmax (8 bytes) in the same command buffer.
     /// Records into `span` if active. Returns (argmax of token 0 = candidate for pos+1, argmax of token 1 = for pos+2).
@@ -808,14 +629,6 @@ impl Engine {
         (u32::from_le_bytes(b[..4].try_into().unwrap()), u32::from_le_bytes(b[4..8].try_into().unwrap()))
     }
 
-    /// Double step with the timestamps of every dispatch (slow: one compute pass per dispatch). Returns (name, ms, bytes) per dispatch.
-    pub fn step2_measured(&self, tok0: u32, tok1: u32, pos: usize) -> Vec<(String, f64, u64)> {
-        self.inputs2(tok0, tok1, pos);
-        let par = self.par.get(); self.par.set(1 - par);
-        let prog = &self.prog2[par];
-        let m = self.gpu.run_commands_measured(prog);
-        prog.iter().zip(&m.gpu_ms).map(|(c, t)| (c.n.clone(), *t, c.byte)).collect()
-    }
 
     /// MTP draft (one token) with h = "xn" as it is (the state after output_norm left by the last single step, or of
     /// token 0 of the last double step): token `tok` at position `pos`. One submit, 4 bytes read. Returns the draft.
@@ -823,16 +636,6 @@ impl Engine {
         self.inputs_mtp(tok, pos);
         let (_, _, _, b) = self.gpu.run_commands_read(&self.prog_mtp, &self.a["am2"], 4);
         self.draft_id(u32::from_le_bytes(b[..4].try_into().unwrap()))
-    }
-    /// Speed path 4 (measurement): a second, chained draft. The MTP block output of the last draft ("x", row
-    /// `row`: 0 after `draft`, 1 after `draft2`) becomes the hidden state of a new MTP step on token `tok` at `pos`.
-    /// Its MTP cache entry at `pos` is speculative, but always rewritten (by `draft` / `draft2`) before it is read.
-    pub fn draft_chain(&self, tok: u32, pos: usize, row: usize) -> u32 {
-        let src = &self.a["x"]; let dst = &self.a["xn"];
-        let mut enc = self.gpu.device.create_command_encoder(&Default::default());
-        enc.copy_buffer_to_buffer(src, (row * 2048 * 4) as u64, dst, 0, 2048 * 4);
-        self.gpu.queue.submit([enc.finish()]);
-        self.draft(tok, pos)
     }
     /// Index of the draft argmax → token id (reduced head: remaps).
     fn draft_id(&self, i: u32) -> u32 { if self.head_ids.is_empty() { i } else { self.head_ids[i as usize] } }
@@ -853,18 +656,12 @@ impl Engine {
         let u = self.u_pos2[N_LAYER].as_ref().expect("MTP layer not loaded");
         self.gpu.write(&u[0], 0, &ub([256, 4, 0, 0, 256, 256, 2, (p1 * 512) as u32]));
         self.gpu.write(&u[1], 0, &ub([1024, 0, 0, 0, 0, 0, 0, (p1 * 512) as u32]));
-        self.gpu.write(&u[2], 0, &ub([p1 as u32 + 1, (ctx() / 128) as u32, fb(1.0 / 16.0), fd_phase(), 0, 0, attn2_flag(), self.mtp_start.get()]));   // attention from mtp_start up to p1 + tok
+        self.gpu.write(&u[2], 0, &ub([p1 as u32 + 1, (ctx() / 128) as u32, fb(1.0 / 16.0), 0, 0, 0, ATTN2_FLAG, self.mtp_start.get()]));   // attention from mtp_start up to p1 + tok
         if self.prof.borrow().is_some() { let b = self.run_profiled(&self.prog_mtp2, "draft2", 4); return self.draft_id(b[0]); }
         let (_, _, _, b) = self.gpu.run_commands_read(&self.prog_mtp2, &self.a["am2"], 4);
         self.draft_id(u32::from_le_bytes(b[..4].try_into().unwrap()))
     }
 
-    /// Double draft for the verifications: h0, h1 (2048 f32 each) written into "xn", then `draft2`.
-    pub fn draft2_verify(&self, h0: &[f32], h1: &[f32], tok1: u32, tok2: u32, pos: usize) -> u32 {
-        let b: Vec<u8> = h0.iter().chain(h1).flat_map(|v| v.to_le_bytes()).collect();
-        self.gpu.write(&self.a["xn"], 0, &b);
-        self.draft2(tok1, tok2, pos)
-    }
 
     /// MECHTA_GEN_PROFILE: runs a program with a timestamp per dispatch (one compute pass each, so slower)
     /// and adds the GPU time of every dispatch to `prof` under "<tag>: <kernel>". Returns the first `n / 4` words of "am2".
@@ -911,13 +708,9 @@ impl Engine {
         let (mut ssm, mut conv, mut kv) = (vec![], vec![], vec![]);
         for il in 0..N_LAYER {
             if attention(il) {
-                // the cache words as they are (f32 values, or the raw bits of f16 / q8 data followed by the q8 scales)
-                let f = kv_format(); let sc0 = f.data_words(ctx() * 512);
-                let read = |buf: &wgpu::Buffer| -> Vec<f32> {
-                    let mut w = self.gpu.read_f32(buf, f.data_words(p * 512));
-                    if f.scale_words(p * 512) > 0 { w.extend(self.gpu.read_f32_from(buf, sc0, f.scale_words(p * 512))); }
-                    w
-                };
+                // the cache words as they are (f32 values, or the raw bits of the f16 pairs)
+                let f = kv_format();
+                let read = |buf: &wgpu::Buffer| -> Vec<f32> { self.gpu.read_f32(buf, f.data_words(p * 512)) };
                 let (k, v) = (self.kv_buf.0[il].as_ref().unwrap(), self.kv_buf.1[il].as_ref().unwrap());
                 kv.push((read(k), read(v)));
             } else {
@@ -934,10 +727,9 @@ impl Engine {
         let (mut j, mut a) = (0, 0);
         for il in 0..N_LAYER {
             if attention(il) {
-                let f = kv_format(); let nd = f.data_words(r.p * 512); let sc0 = 4 * f.data_words(ctx() * 512) as u64;
+                let nd = kv_format().data_words(r.p * 512);
                 for (buf, w) in [(self.kv_buf.0[il].as_ref().unwrap(), &r.kv[a].0), (self.kv_buf.1[il].as_ref().unwrap(), &r.kv[a].1)] {
                     self.gpu.write(buf, 0, &b(&w[..nd].to_vec()));
-                    if w.len() > nd { self.gpu.write(buf, sc0, &b(&w[nd..].to_vec())); }
                 }
                 a += 1;
             } else {
@@ -964,26 +756,7 @@ impl Engine {
 
     /// Reads a work buffer (for the verifications).
     pub fn read(&self, name: &str, n: usize) -> Vec<f32> { self.gpu.read_f32(&self.a[name], n) }
-    /// Like `read`, for the buffers of the prefill (`ap`: "x", "h2", "esw", ...).
-    pub fn read_p(&self, name: &str, n: usize) -> Vec<f32> { self.gpu.read_f32(&self.ap[name], n) }
-    /// For `probe-experts`: prefill in blocks of 512 with one submit per layer, as `prefill_verify` but for the
-    /// whole text; `f(block, segment)` after every segment (0 = embedding, 1 + layer), when the buffers can be read.
-    pub fn prefill_probe(&self, toks: &[u32], f: &mut dyn FnMut(usize, usize)) {
-        assert!(toks.len() % BLOCKS[0] == 0 && toks.len() <= ctx());
-        for (b, block_toks) in toks.chunks(BLOCKS[0]).enumerate() {
-            self.inputs_n(block_toks, b * BLOCKS[0], BLOCKS[0]);
-            let prog = &self.prog_n[0][self.par.get()]; self.par.set(1 - self.par.get());
-            let mut s = 0;
-            for (i, &e) in self.end_n[0].iter().enumerate() { self.run(&prog[s..e]); f(b, i); s = e; }
-            self.run(&prog[s..]);
-        }
-    }
 
-    /// The argmax computed by the GPU in the last token (index, value): 8 bytes read. For the verifications of `token`.
-    pub fn argmax_gpu(&self) -> (u32, f32) {
-        let i = self.gpu.read_f32(&self.a["am2"], 1)[0].to_bits(); let v = self.gpu.read_f32(&self.a["am"], 1)[0];
-        (i, v)
-    }
 
     /// One token as `token`, but returns only the chosen token (argmax on the GPU, 8 bytes read) with ONE submit and one
     /// poll: the copy of the result is in the same command buffer as the computation. Records into `span` if active.
@@ -1037,31 +810,6 @@ impl Engine {
         }
         true
     }
-    /// Calibration: exactly one block of size BLOCKS[ib] (`toks` may be shorter: partial
-    /// block), with the same submits as `prefill`. For measuring the cost of each block size (`block-cost`).
-    pub fn single_block(&self, toks: &[u32], pos0: usize, ib: usize) {
-        assert!(toks.len() <= BLOCKS[ib] && pos0 + toks.len() <= ctx());
-        self.inputs_n(toks, pos0, BLOCKS[ib]);
-        let prog = &self.prog_n[ib][self.par.get()]; self.par.set(1 - self.par.get());
-        let mut s = 0;
-        for &e in &self.cuts_n[ib] { self.run(&prog[s..e]); s = e; }
-        self.run(&prog[s..]);
-    }
-    /// M3 (verifications): a single block, one submit per segment; `f(il, x)` with x = NB rows of "x" after the embedding (il = 0)
-    /// and after every layer (il = 1 + layer), to compare them with the dump position by position.
-    pub fn prefill_verify(&self, toks: &[u32], pos: usize, f: &mut dyn FnMut(usize, Vec<f32>)) {
-        assert!(toks.len() <= NB);
-        let ib = (0..BLOCKS.len()).rev().find(|&j| BLOCKS[j] >= toks.len()).unwrap_or(0);   // the smallest one that is enough
-        self.inputs_n(toks, pos, BLOCKS[ib]);
-        let prog = &self.prog_n[ib][self.par.get()]; self.par.set(1 - self.par.get());
-        let mut s = 0;
-        for (i, &e) in self.end_n[ib].iter().enumerate() { self.run(&prog[s..e]); f(i, self.gpu.read_f32(&self.ap["x"], toks.len() * 2048)); s = e; }
-        self.run(&prog[s..]);
-    }
-    /// M3 (verifications): l_out of the last layer for the tokens of the last block of the prefill (row t = token t of the block).
-    pub fn prefill_outputs(&self, n: usize) -> Vec<f32> { self.gpu.read_f32(&self.ap["x"], n * 2048) }
-    /// MECHTA_PREFILL=blocks: the prompt goes through in blocks of NB tokens (M3) instead of one token at a time.
-    pub fn prefill_in_blocks() -> bool { std::env::var("MECHTA_PREFILL").map(|v| v == "blocks").unwrap_or(false) }
     fn inputs_n(&self, toks: &[u32], pos: usize, nb: usize) {
         let tc = Instant::now();
         let n = toks.len(); assert!(n >= 1 && n <= nb && nb <= NB);
@@ -1080,13 +828,13 @@ impl Engine {
             self.gpu.write(rk, 0, &ub(&[256, 2 * nb as u32, 0, 0, 256, 256, 2, (pos * 512) as u32]));
             self.gpu.write(cv, 0, &ub(&[(nb * 512) as u32, 0, 0, 0, 0, 0, 0, (pos * 512) as u32]));
             for (ch, u) in at.iter().take(nb / 8).enumerate() {
-                let (nb, bb) = if attn_batch() > 0 { (ctx() / prefill_block(), prefill_block() as u32) } else { (ctx() / 128, 0) };
+                let (nb, bb) = (ctx() / PREFILL_BLOCK, PREFILL_BLOCK as u32);
                 self.gpu.write(u, 0, &ub(&[pos as u32 + 1, nb as u32, fb(1.0 / 16.0), 0, (ch * 8) as u32, 0, bb, 0]));
             }
             // attn_fa: one uniform per (group of 64 tokens, split of FA_SPLIT chunks), after the NB / 8 of attn_fd4
             for (i, u) in at.iter().skip(NB / 8).take(nb / 64 * fa_splits()).enumerate() {
                 let (g, sp) = (i / fa_splits(), i % fa_splits());
-                self.gpu.write(u, 0, &ub(&[pos as u32 + 1, (ctx() / FA_CH) as u32, fb(1.0 / 16.0), fa_phase(), (g * 64) as u32, (sp * FA_SPLIT) as u32, FA_CH as u32, 0]));
+                self.gpu.write(u, 0, &ub(&[pos as u32 + 1, (ctx() / FA_CH) as u32, fb(1.0 / 16.0), 0, (g * 64) as u32, (sp * FA_SPLIT) as u32, FA_CH as u32, 0]));
             }
         }
         self.cpu("block inputs (embedding, RoPE, uniform)", tc);
@@ -1229,8 +977,8 @@ fn program_mtp(of: &Factory, conv: &[[wgpu::Buffer; 2]], ssm: &[wgpu::Buffer], k
 /// The uniforms of the double step (M4), shared between program2 and program_mtp2.
 struct Uniforms2 { norm2: wgpu::Buffer, n4096: wgpu::Buffer, n8192: wgpu::Buffer, n1024: wgpu::Buffer, bg2: wgpu::Buffer, conv2: wgpu::Buffer,
               l2x2: wgpu::Buffer, gn2: wgpu::Buffer, qn2: wgpu::Buffer, kn2: wgpu::Buffer, rq2: wgpu::Buffer, moe2: wgpu::Buffer,
-              n512: wgpu::Buffer, moe_tok1: wgpu::Buffer, merge: bool,
-              norm2h: wgpu::Buffer, gn2h: wgpu::Buffer, x16: bool }
+              n512: wgpu::Buffer, moe_tok1: wgpu::Buffer,
+              norm2h: wgpu::Buffer, gn2h: wgpu::Buffer }
 fn uniformi2(of: &Factory) -> Uniforms2 {
     Uniforms2 {
         norm2: of.u([2048, 2, fb(EPS), fb(1.0), 2048, 2048, 1, 0]),
@@ -1245,10 +993,6 @@ fn uniformi2(of: &Factory) -> Uniforms2 {
         moe_tok1: of.u([2048, 8, 0, 0, 0, 0, 2048, 0]),          // one token, flag = offset 2048 of residual and output
         norm2h: of.u([2048, 2, fb(EPS), fb(1.0), 2048, 2048, 1 | 4, 0]),   // f16 output
         gn2h: of.u([128, 64, fb(EPS), fb(1.0), 128, 128, 3 | 4, 0]),
-        // x in f16 in the double step (default); MECHTA_X16=no for x in f32
-        x16: std::env::var("MECHTA_X16").map(|v| v != "no").unwrap_or(true),
-        // experts in union (default); MECHTA_EXPERTS=token = one pass per token (comparisons)
-        merge: std::env::var("MECHTA_EXPERTS").map(|v| v != "token").unwrap_or(true),
     }
 }
 
@@ -1261,7 +1005,7 @@ fn block2(of: &Factory, il: usize, c: &mut Vec<Command>, u: &Uniforms2, par: usi
     let l = |s: &str| format!("blk.{il}.{s}");
     // x in f16 (M4): the producers of x write f16 and the 2-column matvecs read it as f16; the MTP block (moe_only_tok1)
     // stays in f32 because its MoE uses the single-column kernels.
-    let h16 = u.x16 && !moe_only_tok1;
+    let h16 = !moe_only_tok1;
     let mv2 = |n: &str, x: &str, y: &str| if h16 { of.mv2h(n, x, y) } else { of.mv2(n, x, y) };
     let norm2 = if h16 { &u.norm2h } else { &u.norm2 }; let gn2 = if h16 { &u.gn2h } else { &u.gn2 };
     let swi = if h16 { "swiglu16" } else { "swiglu" }; let agate = if h16 { "attn_gate16" } else { "attn_gate" };
@@ -1316,24 +1060,12 @@ fn block2(of: &Factory, il: usize, c: &mut Vec<Command>, u: &Uniforms2, par: usi
     c.push(mv2(&l("ffn_gate_inp.weight"), "h2", "lg"));
     c.push(of.gpu.command(&of.rt, &[(0, a("lg")), (1, a("probs")), (2, a("ids")), (3, a("weights"))], (1, 1, 1), "routing".into(), 0));
     c.push(of.gpu.command(&of.rt2, &[(0, a("lg")), (1, a("probs")), (2, a("ids2")), (3, a("weights"))], (1, 1, 1), "routing b".into(), 0));
-    if u.merge {
-        let mvu = |n: &str, x: &str, y: &str, xp: u32, xt: u32| if h16 { of.mv_uh(n, x, y, xp, xt) } else { of.mv_u(n, x, y, xp, xt) };
-        c.push(of.gpu.command(&of.un, &[(0, a("ids")), (1, a("ids2")), (2, a("uniforms"))], (1, 1, 1), "merge".into(), 0));
-        c.push(mvu(&l("ffn_gate_exps.weight"), "h2", "eg", 0, 2048));
-        c.push(mvu(&l("ffn_up_exps.weight"), "h2", "eu", 0, 2048));
-        c.push(of.op(swi, &[(0, a("eg")), (1, a("eu"))], a("esw"), None, &u.n8192, (d2(128), 1, 1)));
-        c.push(mvu(&l("ffn_down_exps.weight"), "esw", "ed", 512, 4096));
-    } else {
-        assert!(!h16, "MECHTA_EXPERTS=token requires MECHTA_X16=no");
-        for (tok, ids) in [(0u32, "ids"), (1u32, "ids2")] {
-            c.push(of.mv_tok(&l("ffn_gate_exps.weight"), "h2", "eg", 0, tok * 2048, tok * 4096, ids));
-            c.push(of.mv_tok(&l("ffn_up_exps.weight"), "h2", "eu", 0, tok * 2048, tok * 4096, ids));
-        }
-        c.push(of.op("swiglu", &[(0, a("eg")), (1, a("eu"))], a("esw"), None, &u.n8192, (128, 1, 1)));
-        for (tok, ids) in [(0u32, "ids"), (1u32, "ids2")] {
-            c.push(of.mv_tok(&l("ffn_down_exps.weight"), "esw", "ed", 512, tok * 4096, tok * 16384, ids));
-        }
-    }
+    // experts in union: the two tokens' experts read once (merge), x in f16
+    c.push(of.gpu.command(&of.un, &[(0, a("ids")), (1, a("ids2")), (2, a("uniforms"))], (1, 1, 1), "merge".into(), 0));
+    c.push(of.mv_uh(&l("ffn_gate_exps.weight"), "h2", "eg", 0, 2048));
+    c.push(of.mv_uh(&l("ffn_up_exps.weight"), "h2", "eu", 0, 2048));
+    c.push(of.op(swi, &[(0, a("eg")), (1, a("eu"))], a("esw"), None, &u.n8192, (d2(128), 1, 1)));
+    c.push(of.mv_uh(&l("ffn_down_exps.weight"), "esw", "ed", 512, 4096));
     c.push(mv2(&l("ffn_gate_shexp.weight"), "h2", "sg"));
     c.push(mv2(&l("ffn_up_shexp.weight"), "h2", "su"));
     c.push(of.op(swi, &[(0, a("sg")), (1, a("su"))], a("ssw"), None, &u.n1024, (d2(16), 1, 1)));
@@ -1390,11 +1122,11 @@ fn block_n(of: &Factory, il: usize, c: &mut Vec<Command>, u: &UniformsN, par: us
                 let ug = &at[NB / 8 + g * ns..NB / 8 + (g + 1) * ns];
                 for (sp, ua) in ug.iter().enumerate() {
                     let n = FA_SPLIT.min(nch - sp * FA_SPLIT) as u32;
-                    c.push(of.op(mx_entry(), &[(10, vc), (12, kc), (13, a("qh")), (14, vc)], a("att_p"), None, ua, (4, n, 4)));
+                    c.push(of.op("attn_fa_mx", &[(10, vc), (12, kc), (13, a("qh")), (14, vc)], a("att_p"), None, ua, (4, n, 4)));
                 }
                 c.push(of.op("attn_fd_combine", &[(0, a("att_p"))], a("att"), None, &ug[0], (16, 64, 1)));
             }
-        } else if prefill_fa() && nbu >= 64 {
+        } else if nbu >= 64 {
             let (ns, nch) = (fa_splits(), ctx() / FA_CH);
             for g in 0..nbu / 64 {
                 let ug = &at[NB / 8 + g * ns..NB / 8 + (g + 1) * ns];
@@ -1405,9 +1137,8 @@ fn block_n(of: &Factory, il: usize, c: &mut Vec<Command>, u: &UniformsN, par: us
                 c.push(of.op("attn_fd_combine", &[(0, a("att_p"))], a("att"), None, &ug[0], (16, 64, 1)));
             }
         } else { for ua in &at[..nbu / 8] {
-            // attn_fd4 (default): K/V read once per 4 tokens, blocks of prefill_block() positions; MECHTA_ATTN_BATCH=0 for attn_fd per token
-            if attn_batch() > 0 { c.push(of.op("attn_fd4", &[(0, a("qr")), (9, kc), (10, vc)], a("att_p"), None, ua, (2, (ctx() / prefill_block()) as u32, 1))); }
-            else { c.push(of.op("attn_fd", &[(0, a("qr")), (9, kc), (10, vc)], a("att_p"), None, ua, (2, (ctx() / 128) as u32, 8))); }
+            // blocks of 32 and 8 tokens: attn_fd4, K/V read once per 4 tokens, blocks of PREFILL_BLOCK positions
+            c.push(of.op("attn_fd4", &[(0, a("qr")), (9, kc), (10, vc)], a("att_p"), None, ua, (2, (ctx() / PREFILL_BLOCK) as u32, 1)));
             c.push(of.op("attn_fd_combine", &[(0, a("att_p"))], a("att"), None, ua, (16, 8, 1)));
         } }
         c.push(of.op("attn_gate", &[(0, a("att")), (1, a("qf"))], a("ag"), None, &u.n_ag, (nb * 4096 / 64, 1, 1)));
@@ -1493,12 +1224,8 @@ fn program2(of: &Factory, par: usize, conv: &[[wgpu::Buffer; 2]], conv1: &[wgpu:
         seg_ends.push(c.len());
     }
     c.push(of.op("rmsnorm", &[(0, a("x")), (1, &of.w["output_norm.weight"])], a("xn"), None, &u.norm2, (2, 1, 1)));   // h_nextn in f32 for the MTP
-    if u.x16 {
-        c.push(of.op("rmsnorm", &[(0, a("x")), (1, &of.w["output_norm.weight"])], a("xn16"), None, &u.norm2h, (2, 1, 1)));
-        c.push(of.mv2h("output.weight", "xn16", "logits"));
-    } else {
-        c.push(of.mv2("output.weight", "xn", "logits"));
-    }
+    c.push(of.op("rmsnorm", &[(0, a("x")), (1, &of.w["output_norm.weight"])], a("xn16"), None, &u.norm2h, (2, 1, 1)));
+    c.push(of.mv2h("output.weight", "xn16", "logits"));
     argmax2x(of, &mut c);
     (c, seg_ends)
 }
@@ -1520,9 +1247,8 @@ fn program_mtp2(of: &Factory, conv: &[[wgpu::Buffer; 2]], conv1: &[wgpu::Buffer]
     c.push(of.op("rmsnorm", &[(0, a("m_e")), (1, w("blk.40.nextn.enorm.weight"))], a("m_cat"), None, &u_en, (2, 1, 1)));
     c.push(of.op("rmsnorm", &[(0, a("xn")), (1, w("blk.40.nextn.hnorm.weight"))], a("m_cat"), None, &u_hn, (2, 1, 1)));
     c.push(of.mv2("blk.40.nextn.eh_proj.weight", "m_cat", "x"));
-    // MECHTA_MTP2=full: MoE for the first token too (an earlier version, 16/16 drafts); default: cut (on trial, 15/16)
-    let full = std::env::var("MECHTA_MTP2").map(|v| v == "full").unwrap_or(false);
-    block2(of, N_LAYER, &mut c, &u, 0, conv, conv1, ssm, ssm1, kc, vc, u_pos2, tab2, !full);
+    // the MoE runs only for the second token: the first one's output is not needed
+    block2(of, N_LAYER, &mut c, &u, 0, conv, conv1, ssm, ssm1, kc, vc, u_pos2, tab2, true);
     // only the draft of the second token is needed: norm on both (2 rows, costs nothing), output head with ONE column
     // on xn[2048..] (x_off), argmax in am2[0]. Before: 2-column head (6.3 ms vs 5.0) and two argmax.
     c.push(of.op("rmsnorm", &[(0, a("x")), (1, w("blk.40.nextn.shared_head_norm.weight"))], a("xn"), None, &u.norm2, (2, 1, 1)));

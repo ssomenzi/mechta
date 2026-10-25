@@ -29,8 +29,8 @@
 | `MECHTA_SAVE_REQUESTS` | folder where requests are saved | off |
 | `MECHTA_RESERVE_GB` | VRAM kept free while the weights load | 0 (`mechta-serve.sh` sets 2) |
 
-The full list is in `USAGE.md`. The other `MECHTA_*` variables (`ATTN`, `GEMM_*`, `DELTA`, `ORDER`, `FAKE_POS`,
-`REJECT`...) select kernel variants: measurement only.
+The full list is in `USAGE.md`. The variables that select kernel variants, and the measurement switches, are in the
+`lab` branch (`engine/VARIANTS.md`).
 
 ## Set per request (from the client, OpenAI fields)
 `temperature`, `top_p`, `top_k`, `seed`, `max_tokens` / `max_completion_tokens`,

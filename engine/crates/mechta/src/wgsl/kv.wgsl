@@ -8,7 +8,7 @@
 //              written at element p.extra + r * p.step_o; b = [cos 0..31 | sin 0..31]
 //   kv_rope2 — the same for several tokens: table of row r at (r / p.flag) * 64
 //   kv_copy  — V: p.n contiguous elements of `a` written at element p.extra
-// Element offsets are multiples of 256, so a writer thread always owns whole words (f16: 2 elements, q8: 32 + scale).
+// Element offsets are multiples of 256, so a writer thread always owns whole words (f16: 2 elements).
 // The value of dim d after RoPE (d < 64) or as is (d >= 64), as in rope / rope2.
 // FORMAT f16 — 2 bytes per element, two halves per u32 (pack2x16float)
 @group(0) @binding(9) var<storage, read> b4: array<vec2<u32>>;
@@ -30,43 +30,6 @@ fn kv_row(x0: u32, o0: u32, tb: u32, t: u32) {
 fn kv_copy(@builtin(global_invocation_id) gid: vec3<u32>) {
   let e = 2u * gid.x; if (e >= p.n) { return; }
   kvo[(p.extra + e) / 2u] = pack2x16float(vec2<f32>(a[e], a[e + 1u]));
-}
-// FORMAT q8 — 1 byte per element (int8, four per u32) + one f32 scale per 32 elements, stored after the data
-// at word KV_SC (= CTX * 512 / 4, set by the Rust side). Like the Q8_0 of ggml, with an f32 scale.
-@group(0) @binding(9) var<storage, read> b4: array<u32>;
-@group(0) @binding(10) var<storage, read> c4: array<u32>;
-@group(0) @binding(11) var<storage, read_write> kvo: array<u32>;
-const KV_SC: u32 = KV_SC_VALUEu;
-fn kk(i: u32) -> vec4<f32> { return vec4<f32>(unpack4xI8(b4[i])) * bitcast<f32>(b4[KV_SC + i / 8u]); }
-fn vv(i: u32) -> vec4<f32> { return vec4<f32>(unpack4xI8(c4[i])) * bitcast<f32>(c4[KV_SC + i / 8u]); }
-fn kv_src(x0: u32, d: u32, tb: u32) -> f32 {
-  if (d < 32u) { return a[x0 + d] * b[tb + d] - a[x0 + d + 32u] * b[tb + 32u + d]; }
-  if (d < 64u) { let i = d - 32u; return a[x0 + i] * b[tb + 32u + i] + a[x0 + d] * b[tb + i]; }
-  return a[x0 + d];
-}
-// 32 values at element e0 (multiple of 32): scale = max |v| / 127, q = round(v / scale)
-fn kv_put32(e0: u32, v: ptr<function, array<f32, 32>>) {
-  var mx = 0.0;
-  for (var i: u32 = 0u; i < 32u; i++) { mx = max(mx, abs((*v)[i])); }
-  let sc = mx / 127.0; let inv = select(0.0, 1.0 / sc, sc > 0.0);
-  for (var w: u32 = 0u; w < 8u; w++) {
-    let q = vec4<i32>(round(vec4<f32>((*v)[4u * w], (*v)[4u * w + 1u], (*v)[4u * w + 2u], (*v)[4u * w + 3u]) * inv));
-    kvo[e0 / 4u + w] = pack4xI8(clamp(q, vec4<i32>(-127), vec4<i32>(127)));
-  }
-  kvo[KV_SC + e0 / 32u] = bitcast<u32>(sc);
-}
-fn kv_row(x0: u32, o0: u32, tb: u32, t: u32) {
-  if (t >= 8u) { return; }
-  var v: array<f32, 32>;
-  for (var i: u32 = 0u; i < 32u; i++) { v[i] = kv_src(x0, 32u * t + i, tb); }
-  kv_put32(o0 + 32u * t, &v);
-}
-@compute @workgroup_size(256)
-fn kv_copy(@builtin(global_invocation_id) gid: vec3<u32>) {
-  let e = 32u * gid.x; if (e >= p.n) { return; }
-  var v: array<f32, 32>;
-  for (var i: u32 = 0u; i < 32u; i++) { v[i] = a[e + i]; }
-  kv_put32(p.extra + e, &v);
 }
 // FORMAT common — appended after the chosen block
 @compute @workgroup_size(256)

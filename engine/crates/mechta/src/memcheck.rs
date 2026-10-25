@@ -15,7 +15,7 @@ pub const COMMON: [usize; 5] = [32_768, 65_536, 131_072, 196_608, 262_144];
 pub fn need_bytes(ctx: usize, kv: KvFormat) -> u64 {
     let kv_layers = (N_LAYER / 4 + 1) as u64;   // 10 attention layers + the MTP layer, K and V each
     let kv_bytes = 2 * kv_layers * kv.buffer_bytes_for(ctx);
-    let partials = 4 * 258 * 16 * (2 * (ctx / 128) + (8 * (ctx / crate::engine::prefill_block())).max(64 * (ctx / crate::engine::FA_CH))) as u64;   // att_p of decode and prefill
+    let partials = 4 * 258 * 16 * (2 * (ctx / 128) + (8 * (ctx / crate::engine::PREFILL_BLOCK)).max(64 * (ctx / crate::engine::FA_CH))) as u64;   // att_p of decode and prefill
     BASE_BYTES + kv_bytes + partials
 }
 

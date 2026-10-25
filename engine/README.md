@@ -11,12 +11,13 @@ except `crates/shader`, which holds the only two `unsafe` calls of the project, 
 | `crates/api` | the contract between the HTTP server and an engine: the `Engine` trait, `Params`, `Outcome` |
 | `crates/chat` | the official chat templates (Qwen3.6, Flint) rendered with minijinja, and the streaming parser of the model output (reasoning, text, tool calls) |
 | `crates/server` | OpenAI-compatible HTTP server on `std::net`: `/v1/chat/completions` (streaming and not), `/v1/models`, `/health`; plus `fake_engine`, a fake model for testing clients |
-| `crates/mechta` | the `mechta` binary: the engine (`engine.rs`, `session.rs`, `flint.rs`), the WGSL kernels (`src/wgsl/`) and the verification and benchmark tools |
+| `crates/mechta` | the `mechta` binary: the engine (`engine.rs`, `session.rs`, `flint.rs`), the WGSL kernels (`src/wgsl/`) and the tools of the numerical check (`logit-dump`, `kl`, `deq`, `token`) |
 | `crates/tui` | `mechta-chat`, a terminal chat client |
 
 Other files: `SPEC.md` (the operations of one token, in llama.cpp order), `USAGE.md` (every option and environment
-variable), `PARAMETERS.md` and `CALIBRATION.md` (fixed values and how they were chosen), `AUDIT.md` (security review),
+variable), `PARAMETERS.md` and `CALIBRATION.md` (fixed values and how they were chosen), `SECURITY.md` (security notes),
 `DEVLOG.md` (development log), `reference/` (llama.cpp dumps used to check the kernels, not in git), `tools/`.
+The kernel variants and the benchmark tools written on the way are in the `lab` branch (`engine/VARIANTS.md`).
 
 ## Tests
 

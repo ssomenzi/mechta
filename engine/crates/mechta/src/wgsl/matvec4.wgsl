@@ -212,14 +212,6 @@ fn mv_q6_k(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_inde
 @compute @workgroup_size(64)
 fn mv_f32(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) t: u32) { row(3u, wid, t); }
 @compute @workgroup_size(64)
-fn mv_q8_0b(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) t: u32) { row(4u, wid, t); }
-@compute @workgroup_size(64)
-fn mv_read(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) t: u32) { row(5u, wid, t); }
-@compute @workgroup_size(64)
-fn mv_read6(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) t: u32) { row(6u, wid, t); }
-@compute @workgroup_size(64)
-fn mv_q4_k64(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) t: u32) { row(7u, wid, t); }
-@compute @workgroup_size(64)
 fn mv_q3_k(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) t: u32) { row(8u, wid, t); }
 @compute @workgroup_size(64)
 fn mv_q4_1(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) t: u32) { row(9u, wid, t); }

@@ -122,8 +122,8 @@ impl Engine for FlintSession {
         // 1. reuse
         let m = self.in_cache.len();
         let k = self.in_cache.iter().zip(&toks).take_while(|(a, b)| a == b).count().min(n - 1);
-        // the 512 positions before k still in the rings. MECHTA_FLINT_REUSE=photo (tests only): never, so the photo is used
-        let ring_ok = k > 0 && m - k + WINDOW <= RING_SWA + 1 && std::env::var("MECHTA_FLINT_REUSE").map(|v| v != "photo").unwrap_or(true);
+        // the 512 positions before k still in the rings
+        let ring_ok = k > 0 && m - k + WINDOW <= RING_SWA + 1;
         let kf = self.photo_tok.len();
         let photo_ok = kf > 0 && kf <= k && toks[..kf] == self.photo_tok[..];
         let q = if self.use_root { root_point(&toks).filter(|&q| q >= ROOT_MIN && q < n) } else { None };

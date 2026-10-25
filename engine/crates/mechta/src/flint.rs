@@ -5,7 +5,6 @@
 //! Reused: the matvec of the quant types (matvec4.wgsl), rmsnorm / sum / swiglu (ops.wgsl). New: flint_*.wgsl.
 //! Everything in f32 (activations and KV cache): this is the correctness step, not the fast one.
 use crate::engine::{binding_op, mv_piece_geometry, ops_source, q3_source, KvFormat};
-use crate::verify::{err, Dump};
 use mechta_gguf::{Gguf, TType, Value};
 use mechta_gpu::{wgpu, Command, Gpu};
 use std::collections::HashMap;
@@ -90,8 +89,8 @@ fn v4(i: u32) -> vec4<f32> { let w = vcr[i]; return vec4<f32>(unpack2x16float(w.
 fn kv_put(i: u32, k: vec2<f32>, v: vec2<f32>) { kcw[i] = pack2x16float(k); vcw[i] = pack2x16float(v); }
 ";
 /// flint_attn.wgsl with the block of the K/V format (`kv_f16`), and the prefill attention keeping Q, K, V in f32 in
-/// shared memory (36 KB per workgroup): default (with packed f16 the K/V cache
-/// drifts to an error of ~1 by layer 46, with f32 to 4e-4). MECHTA_FLINT_PF=f16 for packed f16 as attn_fa of Qwen.
+/// shared memory (36 KB per workgroup; with packed f16, as attn_fa of Qwen, the K/V cache drifts to an error of ~1 by
+/// layer 46, with f32 to 4e-4). The file is written for packed f16: the three replacements below make it f32.
 pub fn attn_source() -> String { attn_source_for(kv_f16()) }
 /// As `attn_source`, with the cache format given (the shader check compiles both).
 pub fn attn_source_for(f16: bool) -> String {
@@ -99,18 +98,12 @@ pub fn attn_source_for(f16: bool) -> String {
     let sign_bit = "// KV-FORMAT:";
     let i = base.find(sign_bit).expect("KV-FORMAT");
     let s = format!("{}{}{}", &base[..i], if f16 { KV_F16 } else { KV_F32 }, &base[i..]);
-    if std::env::var("MECHTA_FLINT_PF").map(|v| v != "f16").unwrap_or(true) {
-        let r = |s: String, a: &str, b: &str| { assert!(s.contains(a), "{a}"); s.replace(a, b) };
-        let s = r(s, "var<workgroup> fab: array<vec2<u32>, 1152>;", "var<workgroup> fab: array<vec4<f32>, 1152>;");
-        let s = r(s, "fn pk4(v: vec4<f32>) -> vec2<u32> { return vec2<u32>(pack2x16float(v.xy), pack2x16float(v.zw)); }", "fn pk4(v: vec4<f32>) -> vec4<f32> { return v; }");
-        return r(s, "fn up4(w: vec2<u32>) -> vec4<f32> { return vec4<f32>(unpack2x16float(w.x), unpack2x16float(w.y)); }", "fn up4(w: vec4<f32>) -> vec4<f32> { return w; }");
-    }
-    s
+    let r = |s: String, a: &str, b: &str| { assert!(s.contains(a), "{a}"); s.replace(a, b) };
+    let s = r(s, "var<workgroup> fab: array<vec2<u32>, 1152>;", "var<workgroup> fab: array<vec4<f32>, 1152>;");
+    let s = r(s, "fn pk4(v: vec4<f32>) -> vec2<u32> { return vec2<u32>(pack2x16float(v.xy), pack2x16float(v.zw)); }", "fn pk4(v: vec4<f32>) -> vec4<f32> { return v; }");
+    r(s, "fn up4(w: vec2<u32>) -> vec4<f32> { return vec4<f32>(unpack2x16float(w.x), unpack2x16float(w.y)); }", "fn up4(w: vec4<f32>) -> vec4<f32> { return w; }")
 }
 
-/// MECHTA_FLINT_ATTN=sink: the generation attention of F3 (one workgroup per query head, K/V read 8 times), for the
-/// comparisons. Default: attn_fd (flash-decoding).
-fn attn_sink_old() -> bool { std::env::var("MECHTA_FLINT_ATTN").is_ok_and(|v| v == "sink") }
 
 /// K/V of a prefix (see `Flint::read_root`).
 pub struct FlintRoot { pub p: usize, pub kv: Vec<(Vec<f32>, Vec<f32>)> }
@@ -202,8 +195,7 @@ impl Flint {
         let mut fl: HashMap<&'static str, wgpu::ComputePipeline> = HashMap::new();
         let src_attn = attn_source();
         if kv_f16() { eprintln!("Flint K/V cache: f16 (MECHTA_FLINT_KV=f16)"); }
-        assert!(!(kv_f16() && attn_sink_old()), "MECHTA_FLINT_ATTN=sink reads an f32 cache only");
-        for e in ["rope_neox", "kv_write", "attn_sink", "attn_fd", "attn_fd_merge", "rope_neox_n", "kv_write_n", "attn_pf"] { fl.insert(e, gpu.pipeline(&src_attn, e)); }
+        for e in ["rope_neox", "kv_write", "attn_fd", "attn_fd_merge", "rope_neox_n", "kv_write_n", "attn_pf"] { fl.insert(e, gpu.pipeline(&src_attn, e)); }
         for e in ["routing_sig", "routing_sig_n"] { fl.insert(e, gpu.pipeline(include_str!("wgsl/flint_moe.wgsl"), e)); }
         for e in ["moe_sum6", "moe_sum6_n"] { fl.insert(e, gpu.pipeline(include_str!("wgsl/flint_sum.wgsl"), e)); }
         fl.insert("gather", gpu.pipeline(include_str!("wgsl/routing.wgsl"), "gather"));
@@ -248,7 +240,7 @@ impl Flint {
         let u_full_n: Vec<wgpu::Buffer> = (0..NB / 8 / GPD).map(|_| gpu.uniform(&[0u32; 8])).collect();
 
         // weights (token_embd stays on the CPU: one row per token)
-        let mem0 = crate::profile::gpu_memory();
+        let mem0 = crate::tools::gpu_memory();
         let mut w = HashMap::new(); let mut byte_gpu = 0u64;
         for t in g.tensors.clone() {
             if t.name == "token_embd.weight" { continue; }
@@ -259,7 +251,7 @@ impl Flint {
             gpu.queue.submit([]);
             gpu.device.poll(wgpu::PollType::wait_indefinitely()).expect("poll");
             // safety, as the Qwen engine: GPU memory must not grow more than the weights + 3 GB
-            let (v1, g1) = crate::profile::gpu_memory();
+            let (v1, g1) = crate::tools::gpu_memory();
             let grown = (v1 - mem0.0) + (g1 - mem0.1);
             assert!(grown < byte_gpu as f64 / 1e9 + 3.0, "GPU memory grew {grown:.2} GB for {:.2} GB of weights: stopping", byte_gpu as f64 / 1e9);
         }
@@ -437,14 +429,10 @@ fn program(of: &Factory, conf: &Conf, kc: &[wgpu::Buffer], vc: &[wgpu::Buffer], 
             ("qr", "kr")
         } else { ("qn", "kn") };
         c.push(of.fl("kv_write", &[(0, a(ka)), (1, a("v")), (11, &kc[il]), (12, &vc[il]), (7, &u_att[il])], g64(KV_ROW / 2)));
-        if attn_sink_old() {
-            c.push(of.fl("attn_sink", &[(0, a(qa)), (1, &kc[il]), (2, &vc[il]), (3, w("attn_sinks.weight")), (4, a("sc")), (5, a("att")), (7, &u_att[il])], (N_HEAD as u32, 1, 1)));
-        } else {
-            // flash-decoding: pieces of 256 positions over the rows the layer can have (ring or ctx), the empty ones exit
-            let rows = if conf.swa[il] { RING_SWA } else { of.a("sc").size() as usize / 4 / N_HEAD };
-            c.push(of.fl("attn_fd", &[(0, a(qa)), (9, &kc[il]), (10, &vc[il]), (4, a("sc")), (7, &u_att[il])], (N_HEAD_KV as u32, rows.div_ceil(256) as u32, 1)));
-            c.push(of.fl("attn_fd_merge", &[(3, w("attn_sinks.weight")), (4, a("sc")), (5, a("att")), (7, &u_att[il])], (N_HEAD as u32, 1, 1)));
-        }
+        // flash-decoding: pieces of 256 positions over the rows the layer can have (ring or ctx), the empty ones exit
+        let rows = if conf.swa[il] { RING_SWA } else { of.a("sc").size() as usize / 4 / N_HEAD };
+        c.push(of.fl("attn_fd", &[(0, a(qa)), (9, &kc[il]), (10, &vc[il]), (4, a("sc")), (7, &u_att[il])], (N_HEAD_KV as u32, rows.div_ceil(256) as u32, 1)));
+        c.push(of.fl("attn_fd_merge", &[(3, w("attn_sinks.weight")), (4, a("sc")), (5, a("att")), (7, &u_att[il])], (N_HEAD as u32, 1, 1)));
         c.push(of.mv(&l("attn_output.weight"), "att", "ao", 0));
         c.push(of.op("sum", &[(0, a("ao")), (1, a("x"))], a("x2"), &u_h, g64(HIDDEN)));
         // feed-forward
@@ -537,215 +525,6 @@ fn program_n(of: &Factory, conf: &Conf, kc: &[wgpu::Buffer], vc: &[wgpu::Buffer]
         cuts.push(c.len());
     }
     (c, cuts)
-}
-
-fn argmax(v: &[f32]) -> (usize, f32) {
-    let (mut i1, mut v1, mut v2) = (0usize, f32::NEG_INFINITY, f32::NEG_INFINITY);
-    for (i, x) in v.iter().enumerate() { if *x > v1 { v2 = v1; v1 = *x; i1 = i; } else if *x > v2 { v2 = *x; } }
-    (i1, v1 - v2)
-}
-
-/// `mechta flint-verify <reference dir>`: F3 (criterion written before the run).
-pub fn verify(dir: &str) {
-    const TIE: f32 = 0.5;
-    let t0 = std::time::Instant::now();
-    let (v0, g0) = crate::profile::gpu_memory();
-    let ctx = 1024;
-    let f = Flint::new(&crate::model_path(), ctx);
-    let (v1, g1) = crate::profile::gpu_memory();
-    println!("GPU {} · weights {:.2} GB in {:.1} s · VRAM {v0:.2} -> {v1:.2} GB · GTT {g0:.2} -> {g1:.2} GB",
-             f.gpu.info.name, f.byte_gpu as f64 / 1e9, t0.elapsed().as_secs_f64());
-    let mut d = Dump::load_file(&format!("{dir}/tensors.bin"));
-    // token.tsv columns: phase, pos, token, text, top5 (header skipped)
-    let rows: Vec<(bool, u32)> = std::fs::read_to_string(format!("{dir}/token.tsv")).expect("token.tsv").lines().skip(1)
-        .map(|r| { let c: Vec<&str> = r.split('\t').collect(); (c[0] == "prompt", c[2].parse().expect("token")) }).collect();
-    let n_prompt = rows.iter().filter(|r| r.0).count();
-    let reference: Vec<u32> = rows.iter().map(|r| r.1).collect();
-    let mut nan = false;
-    let mut ok1 = true;
-    let mut l48_max = 0f64;
-    // MECHTA_FLINT_LAYERS=1,28,29: per-layer errors at those positions (to find where an error is born)
-    let layers: Vec<usize> = std::env::var("MECHTA_FLINT_LAYERS").unwrap_or_default().split(',').filter_map(|v| v.parse().ok()).collect();
-    let mut table: Vec<String> = vec![];
-    // MECHTA_FLINT_LOGITS_ONLY=1 (long references, only result_output and l_out-<last>): one submit per token
-    let only = std::env::var("MECHTA_FLINT_LOGITS_ONLY").is_ok_and(|v| v == "1");
-    let mut err_logit: Vec<(usize, f64)> = vec![];
-    // 1. forced
-    println!("\n1. forced: the reference token at every position");
-    println!("{:>3} {:>7} | {:>7} {:>7} {:>6} {:>6} | {:>9} {:>9} {:>9} {:>9}", "pos", "in", "mechta", "llama", "margin", "same", "logit err", "ffn_inp", "l_out max", "l_out 48");
-    for (pos, &tok) in reference.iter().enumerate() {
-        let (mut e_inp, mut e_out, mut e_last) = (0f64, 0f64, 0f64);
-        let last = f.conf.n_layer - 1;
-        let lg = if only {
-            let lg = f.token(tok, pos);
-            let eo = err(&f.read_x(), &d.get(&format!("l_out-{last}"), pos as i32, 0));
-            if eo.is_nan() { nan = true; }
-            e_out = eo; e_last = eo;
-            lg
-        } else { f.token_layers(tok, pos, &mut |il, x2, x| {
-            let ei = err(&x2, &d.get(&format!("ffn_inp-{il}"), pos as i32, 0));
-            let eo = err(&x, &d.get(&format!("l_out-{il}"), pos as i32, 0));
-            if ei.is_nan() || eo.is_nan() { nan = true; }
-            e_inp = e_inp.max(ei); e_out = e_out.max(eo);
-            if il == last { e_last = eo; }
-            if layers.contains(&pos) {
-                let rx = d.get(&format!("l_out-{il}"), pos as i32, 0);
-                let mx = rx.iter().fold(0f32, |m, v| m.max(v.abs()));
-                let arg = rx.iter().enumerate().fold((0, 0f32), |m, (i, v)| if v.abs() > m.1 { (i, v.abs()) } else { m }).0;
-                let dmax = x.iter().zip(&rx).enumerate().fold((0, 0f32), |m, (i, (a, b))| if (a - b).abs() > m.1 { (i, (a - b).abs()) } else { m });
-                table.push(format!("pos {pos:>2} layer {il:>2} {} ffn_inp {ei:.2e} l_out {eo:.2e} · max|ref| {mx:.1} at {arg} · max diff {:.3} at {}",
-                    if f.conf.swa[il] { "swa " } else { "full" }, dmax.1, dmax.0));
-            }
-        }) };
-        let rl = d.get("result_output", pos as i32, 0);
-        let el = err(&lg, &rl);
-        err_logit.push((pos, el));
-        if el.is_nan() { nan = true; }
-        let (mine, _) = argmax(&lg);
-        let (theirs, margin) = argmax(&rl);
-        let equal = mine == theirs;
-        if !equal && margin >= TIE { ok1 = false; }
-        l48_max = l48_max.max(e_last);
-        println!("{pos:>3} {tok:>7} | {mine:>7} {theirs:>7} {margin:>6.2} {:>6} | {el:>9.2e} {e_inp:>9.2e} {e_out:>9.2e} {e_last:>9.2e}",
-                 if equal { "yes" } else if margin < TIE { "tie" } else { "NO" });
-    }
-    for r in &table { println!("{r}"); }
-    // 2. free: greedy from the prompt
-    println!("\n2. free: {} greedy tokens from the prompt", reference.len() - n_prompt);
-    let mut input = reference[0];
-    let mut my_tokens = vec![];
-    for pos in 0..reference.len() - 1 {
-        let lg = f.token(input, pos);
-        let (mine, _) = argmax(&lg);
-        if pos + 1 < n_prompt { input = reference[pos + 1]; } else { my_tokens.push(mine as u32); input = mine as u32; }
-    }
-    let expected = &reference[n_prompt..];
-    let first = my_tokens.iter().zip(expected).position(|(a, b)| a != b);
-    let ok2 = match first {
-        None => true,
-        Some(i) => {
-            let rl = d.get("result_output", (n_prompt - 1 + i) as i32, 0);
-            let (_, margin) = argmax(&rl);
-            println!("first different at generated token {i} (position {}), reference margin {margin:.2}", n_prompt + i);
-            margin < TIE
-        }
-    };
-    println!("mechta: {my_tokens:?}\nllama:  {expected:?}");
-    let ok3 = !nan && l48_max < 0.1;
-    println!("\ncriterion: forced {} · free {} · no NaN and l_out-48 < 0.1 {} (max {l48_max:.2e})",
-             if ok1 { "ok" } else { "FAIL" }, if ok2 { "ok" } else { "FAIL" }, if ok3 { "ok" } else { "FAIL" });
-    println!("VERDICT: {}", if ok1 && ok2 && ok3 { "PASS" } else { "FAIL" });
-    // window ring: median logit error after the first wrap against before it
-    if reference.len() > WINDOW + 20 {
-        let median = |da: usize, a: usize| { let mut v: Vec<f64> = err_logit.iter().filter(|(p, _)| *p >= da && *p < a).map(|(_, e)| *e).collect(); v.sort_by(f64::total_cmp); v[v.len() / 2] };
-        let (before, after) = (median(100, WINDOW), median(WINDOW, reference.len()));
-        println!("window: median logit error 100..{WINDOW} {before:.2e} · {WINDOW}..{} {after:.2e} · ratio {:.2} · {}",
-                 reference.len(), after / before, if after <= 2.0 * before && ok1 { "WINDOW PASS" } else { "WINDOW FAIL" });
-    }
-}
-
-/// `mechta flint-prefill <text> <n> [k]` (F4): the first n tokens of the text (Flint
-/// tokenizer, MECHTA_TOKENIZER) after `<|user|>`, two ways on the same engine: A = one token at a time (F3, verified),
-/// or with k: prefill calls of k tokens (blocks cut at other places), then the last token; B = prefill of n - 1 tokens
-/// in blocks + the last one alone. K/V caches zeroed between the two. Compared: logits of the last
-/// token (KL, argmax) and the K/V caches of every layer (all the rows both paths wrote).
-pub fn verify_prefill(text: &str, n: usize, k: Option<usize>) {
-    let tk = tokenizers::Tokenizer::from_file(crate::tokenizer_path()).expect("tokenizer");
-    let s = std::fs::read_to_string(text).expect("text");
-    let mut toks = vec![150_003u32];
-    toks.extend(tk.encode(s, false).expect("encode").get_ids());
-    assert!(toks.len() >= n, "the text gives {} tokens, {n} asked", toks.len());
-    toks.truncate(n);
-    let ctx = n.next_multiple_of(1024);
-    let t0 = std::time::Instant::now();
-    let f = Flint::new(&crate::model_path(), ctx);
-    println!("GPU {} · weights {:.2} GB in {:.1} s · {n} tokens, ctx {ctx}", f.gpu.info.name, f.byte_gpu as f64 / 1e9, t0.elapsed().as_secs_f64());
-    // A
-    let t = std::time::Instant::now();
-    let la = match k {
-        None => { let mut la = vec![]; for (pos, &tok) in toks.iter().enumerate() { la = f.token(tok, pos); } la }
-        Some(k) => {
-            let mut sm = 0f64;
-            for (i, piece) in toks[..n - 1].chunks(k).enumerate() { f.prefill(piece, i * k); sm = sm.max(f.submit_max.get()); }
-            println!("A: prefill in calls of {k} tokens, longest submit {sm:.0} ms");
-            f.token(toks[n - 1], n - 1)
-        }
-    };
-    let ta = t.elapsed().as_secs_f64();
-    let rows = |il: usize| if f.conf.swa[il] { n.min(RING_SWA) } else { n };
-    let kva: Vec<(Vec<f32>, Vec<f32>)> = (0..f.conf.n_layer).map(|il| f.read_kv(il, rows(il))).collect();
-    // B
-    f.reset_kv();
-    let t = std::time::Instant::now();
-    f.prefill(&toks[..n - 1], 0);
-    let tp = t.elapsed().as_secs_f64();
-    let lb = f.token(toks[n - 1], n - 1);
-    println!("A: {n} tokens one at a time in {ta:.1} s ({:.1} t/s) · B: prefill of {} in {tp:.2} s ({:.0} t/s), longest submit {:.0} ms",
-             n as f64 / ta, n - 1, (n - 1) as f64 / tp, f.submit_max.get());
-    // logits
-    let sm = |v: &[f32]| { let m = v.iter().cloned().fold(f32::NEG_INFINITY, f32::max) as f64; let e: Vec<f64> = v.iter().map(|x| (*x as f64 - m).exp()).collect(); let z: f64 = e.iter().sum(); e.into_iter().map(|x| x / z).collect::<Vec<f64>>() };
-    let (pa, pb) = (sm(&la), sm(&lb));
-    let kl: f64 = pa.iter().zip(&pb).filter(|(a, _)| **a > 0.0).map(|(a, b)| a * (a / b.max(1e-300)).ln()).sum();
-    let (ma, _) = argmax(&la); let (mb, _) = argmax(&lb);
-    println!("last token: KL(A||B) {kl:.2e} · argmax A {ma} B {mb} · logit err {:.2e}", err(&lb, &la));
-    // caches
-    let mut kv_max = 0f64; let mut worst = 0;
-    for il in 0..f.conf.n_layer {
-        let (kb, vb) = f.read_kv(il, rows(il));
-        let (ek, ev) = (err(&kb, &kva[il].0), err(&vb, &kva[il].1));
-        if ek.is_nan() || ev.is_nan() { kv_max = f64::NAN; }
-        if ek.max(ev) > kv_max { kv_max = ek.max(ev); worst = il; }
-        if il % 8 == 0 || il == f.conf.n_layer - 1 { println!("layer {il:>2} {}: K err {ek:.2e} · V err {ev:.2e}", if f.conf.swa[il] { "swa " } else { "full" }); }
-        // where: the 6 rows with the largest difference (position of the row, block of 512, error of the row)
-        if [1usize, 2, 8, 46].contains(&il) {
-            let mx = vb.iter().chain(&kb).fold(0f32, |m, v| m.max(v.abs())).max(1e-30);
-            let mut per: Vec<(usize, f32)> = (0..rows(il)).map(|r| {
-                let d = |x: &[f32], y: &[f32]| x[r * KV_ROW..(r + 1) * KV_ROW].iter().zip(&y[r * KV_ROW..(r + 1) * KV_ROW]).fold(0f32, |m, (a, b)| m.max((a - b).abs()));
-                (r, d(&kb, &kva[il].0).max(d(&vb, &kva[il].1)) / mx)
-            }).collect();
-            let how_many = per.iter().filter(|x| x.1 > 1e-2).count();
-            per.sort_by(|a, b| b.1.total_cmp(&a.1));
-            let pos = |r: usize| if f.conf.swa[il] { (n - 1) - ((n - 1 + RING_SWA - r) % RING_SWA) } else { r };
-            println!("  layer {il}: rows with err > 1e-2: {how_many} of {} · worst: {}", rows(il),
-                     per.iter().take(6).map(|(r, e)| format!("pos {} (block {}, +{}) {e:.2e}", pos(*r), pos(*r) / NB, pos(*r) % NB)).collect::<Vec<_>>().join(" · "));
-        }
-    }
-    println!("K/V: worst {kv_max:.2e} (layer {worst})");
-    let ok = kl <= 1e-3 && ma == mb && kv_max <= 1e-2;
-    println!("VERDICT: {}", if ok { "PASS" } else { "FAIL" });
-}
-
-/// `mechta flint-profile <pos,pos,...>`: GPU time of one token by group of kernels at the given positions
-/// (the cache is not filled: the cost of a kernel does not depend on the values), median of 5, plus the wall time of
-/// `token()` (logits read back included). To find what limits the generation.
-pub fn profile(positions: &[usize]) {
-    let ctx = positions.iter().max().copied().unwrap_or(0).next_multiple_of(1024).max(4096);
-    let f = Flint::new(&crate::model_path(), ctx);
-    println!("GPU {} · ctx {ctx}", f.gpu.info.name);
-    let group = |n: &str| -> &'static str {
-        if n == "attn_sink" || n == "attn_fd" || n == "attn_fd_merge" { "attention" } else if n.contains("_exps") { "experts" } else if n.contains("shexp") { "shared expert" }
-        else if n.contains(".attn_") { "attention weights (q,k,v,o)" } else if n == "output.weight" { "output head" }
-        else if n.contains("ffn_") { "dense ffn + router" } else { "small ops" }
-    };
-    for &pos in positions {
-        f.inputs(1000, pos);
-        let mut rounds: Vec<std::collections::BTreeMap<&'static str, f64>> = vec![];
-        for _ in 0..5 {
-            let m = f.gpu.run_commands_measured(&f.prog);
-            let mut g = std::collections::BTreeMap::new();
-            for (c, ms) in f.prog.iter().zip(&m.gpu_ms) { *g.entry(group(&c.n)).or_insert(0.0) += ms; }
-            rounds.push(g);
-        }
-        let mut wall = vec![];
-        for _ in 0..5 { let t = std::time::Instant::now(); f.token(1000, pos); wall.push(t.elapsed().as_secs_f64() * 1e3); }
-        wall.sort_by(f64::total_cmp);
-        let mid = |k: &str| { let mut v: Vec<f64> = rounds.iter().map(|g| g[k]).collect(); v.sort_by(f64::total_cmp); v[2] };
-        let tot: f64 = rounds[0].keys().map(|k| mid(k)).sum();
-        println!("\nposition {pos}: GPU sum {tot:.1} ms (dispatches timed one by one) · token() wall {:.1} ms = {:.1} t/s", wall[2], 1e3 / wall[2]);
-        let mut v: Vec<(&str, f64)> = rounds[0].keys().map(|k| (*k, mid(k))).collect();
-        v.sort_by(|a, b| b.1.total_cmp(&a.1));
-        for (k, ms) in v { println!("  {k:30} {ms:7.2} ms  {:5.1}%", 100.0 * ms / tot); }
-    }
 }
 
 /// `mechta flint-logit-dump <text> <prefill> <steps> <out>`: the tokens of the text

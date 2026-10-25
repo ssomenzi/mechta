@@ -314,10 +314,6 @@ impl Engine for Session {
         // MECHTA_GEN_PROFILE=1 the GPU time of every kernel of one cycle in 8
         let gen_profile = std::env::var("MECHTA_GEN_PROFILE").is_ok_and(|v| v == "1");
         let mut prof_sum: std::collections::HashMap<String, (f64, u32)> = std::collections::HashMap::new();
-        // speed path 4 (measurement, MECHTA_MTP_CHAIN=measure): a chained second draft d2 for the token after the draft;
-        // counted right when the next cycle accepts the draft and its second token equals d2
-        let chain = std::env::var("MECHTA_MTP_CHAIN").is_ok_and(|v| v == "measure");
-        let (mut d2, mut c_first, mut c_second): (Option<u32>, usize, usize) = (None, 0, 0);
         let (mut w_double, mut w_sample, mut w_draft, mut w_restore, mut w_cycles) = (0.0f64, 0.0f64, 0.0f64, 0.0f64, 0usize);
         let mut profiled = 0usize;
         *m.prof.borrow_mut() = None;
@@ -363,7 +359,6 @@ impl Engine for Session {
                 let t_sample = tc.elapsed().as_secs_f64() * 1e3 - t_double;
                 cycles += 1; if a0 == d { accepted += 1; }
                 fed = if a0 == d { pos + 2 } else { pos + 1 };
-                if let Some(x) = d2 { if a0 == d { c_first += 1; if a1 == x { c_second += 1; } } }
                 if a0 == d {
                     if let Some(f) = u.emit(d) { break 'g f; }
                     if let Some(f) = u.emit(a1) { break 'g f; }
@@ -371,7 +366,6 @@ impl Engine for Session {
                     d = m.draft2(d, a1, pos);
                     if !prof_now { w_draft += td.elapsed().as_secs_f64() * 1e3; }
                     pos += 2; cur = a1;
-                    if chain { d2 = Some(m.draft_chain(d, pos + 1, 1)); }
                 } else {
                     let tr = Instant::now();
                     m.restore();
@@ -381,7 +375,6 @@ impl Engine for Session {
                     d = m.draft(a0, pos + 1);
                     if !prof_now { w_draft += td.elapsed().as_secs_f64() * 1e3; }
                     pos += 1; cur = a0;
-                    if chain { d2 = Some(m.draft_chain(d, pos + 1, 0)); }
                 }
                 if !prof_now { w_double += t_double; w_sample += t_sample; w_cycles += 1; }
                 else { let p = m.prof.borrow_mut().take(); *m.prof.borrow_mut() = None; acc_prof(&mut prof_sum, p); }
@@ -411,7 +404,6 @@ impl Engine for Session {
                 w_double / c, w_sample / c, w_draft / c, w_restore / c);
         }
         if profiled > 0 { print_prof(&prof_sum, profiled); }
-        if chain && c_first > 0 { eprintln!("mtp chain: second draft right in {c_second}/{c_first} cycles with the first draft accepted ({:.0}%)", 100.0 * c_second as f64 / c_first as f64); }
         if cycles > 0 {
             eprintln!("mtp: {accepted}/{cycles} drafts accepted ({:.0}%) · accept={} · kv={}", 100.0 * accepted as f64 / cycles as f64,
                 if greedy_accept { "greedy" } else { "exact" }, crate::engine::kv_format().name());
@@ -450,7 +442,6 @@ pub fn test_session(file: &str, max: usize) {
         text
     };
     run_one(&mut s, "request 1", &p1);
-    if std::env::var("MECHTA_TEST_ONE").is_ok() { return; }
     let a = run_one(&mut s, "request 2 (reuse)", &p2);
     s.forget();
     let b = run_one(&mut s, "request 2 (from scratch)", &p2);

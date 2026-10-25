@@ -17,18 +17,6 @@ fn q8_0(@builtin(global_invocation_id) gid: vec3<u32>) {
   for (var i: u32 = 0u; i < 32u; i++) { out[b * 32u + i] = d * s8(by(base + 2u + i)); }
 }
 
-// Q4_1 (Flint INT4): block of 32 = d (f16), m (f16), 16 bytes; y[j] = (qs[j] & 15) d + m,
-// y[j + 16] = (qs[j] >> 4) d + m, as dequantize_row_q4_1 of ggml.
-@compute @workgroup_size(64)
-fn q4_1(@builtin(global_invocation_id) gid: vec3<u32>) {
-  let b = gid.x; if (b >= p.nblocks) { return; }
-  let base = b * 20u; let d = h16(base); let m = h16(base + 2u);
-  for (var j: u32 = 0u; j < 16u; j++) {
-    let q = by(base + 4u + j);
-    out[b * 32u + j] = f32(q & 0xFu) * d + m;
-    out[b * 32u + j + 16u] = f32(q >> 4u) * d + m;
-  }
-}
 
 fn scale_min(s: u32, j: u32) -> vec2<u32> {
   if (j < 4u) { return vec2<u32>(by(s + j) & 63u, by(s + j + 4u) & 63u); }
@@ -73,36 +61,3 @@ fn q6_k(@builtin(global_invocation_id) gid: vec3<u32>) {
   }
 }
 
-// Q3_K: dequantize_row_q3_K of ggml-quants.c, line by line (one thread per block of 256, 110 bytes:
-// hmask[32], qs[64], scales[12], d). An implementation independent of q3k.wgsl, to check the Q3_K kernels against.
-@compute @workgroup_size(64)
-fn q3_k(@builtin(global_invocation_id) gid: vec3<u32>) {
-  let b = gid.x; if (b >= p.nblocks) { return; }
-  let base = b * 110u; let hm = base; let qs = base + 32u; let sc = base + 96u;
-  let d_all = h16(base + 108u);
-  let a0 = by(sc) | (by(sc + 1u) << 8u) | (by(sc + 2u) << 16u) | (by(sc + 3u) << 24u);
-  let a1 = by(sc + 4u) | (by(sc + 5u) << 8u) | (by(sc + 6u) << 16u) | (by(sc + 7u) << 24u);
-  let tmp = by(sc + 8u) | (by(sc + 9u) << 8u) | (by(sc + 10u) << 16u) | (by(sc + 11u) << 24u);
-  var aux = array<u32, 4>(
-    (a0 & 0x0f0f0f0fu) | (((tmp >> 0u) & 0x03030303u) << 4u),
-    (a1 & 0x0f0f0f0fu) | (((tmp >> 2u) & 0x03030303u) << 4u),
-    ((a0 >> 4u) & 0x0f0f0f0fu) | (((tmp >> 4u) & 0x03030303u) << 4u),
-    ((a1 >> 4u) & 0x0f0f0f0fu) | (((tmp >> 6u) & 0x03030303u) << 4u));
-  var is = 0u; var m = 1u; var o = b * 256u;
-  for (var n: u32 = 0u; n < 2u; n++) {
-    var shift = 0u;
-    for (var j: u32 = 0u; j < 4u; j++) {
-      var dl = d_all * (s8((aux[is / 4u] >> (8u * (is % 4u))) & 0xFFu) - 32.0); is++;
-      for (var l: u32 = 0u; l < 16u; l++) {
-        let q = (by(qs + 32u * n + l) >> shift) & 3u;
-        out[o] = dl * (f32(q) - select(4.0, 0.0, (by(hm + l) & m) != 0u)); o++;
-      }
-      dl = d_all * (s8((aux[is / 4u] >> (8u * (is % 4u))) & 0xFFu) - 32.0); is++;
-      for (var l: u32 = 0u; l < 16u; l++) {
-        let q = (by(qs + 32u * n + l + 16u) >> shift) & 3u;
-        out[o] = dl * (f32(q) - select(4.0, 0.0, (by(hm + l + 16u) & m) != 0u)); o++;
-      }
-      shift += 2u; m <<= 1u;
-    }
-  }
-}
