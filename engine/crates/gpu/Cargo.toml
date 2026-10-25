@@ -1,0 +1,10 @@
+[package]
+name = "mechta-gpu"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[dependencies]
+wgpu = "30.0.1"
+pollster = "1.0.1"
+mechta-shader = { path = "../shader" }

@@ -1,0 +1,1 @@
+<|user|>Che ore sono?<|assistant|><tool_call>ora</tool_call><|observation|><tool_response>12:00</tool_response><|assistant|>

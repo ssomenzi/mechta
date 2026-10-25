@@ -1,0 +1,12 @@
+# build output
+target*/
+engine/tools/deq_ref
+__pycache__/
+# prefix cache written by the server (MECHTA_CACHE), hundreds of MB per root
+prefix-cache/
+# llama.cpp reference dumps used by the verification tools (large binaries, produced locally)
+engine/reference/**/*.bin
+engine/reference-mtp/**/*.bin
+# requests and outputs saved with MECHTA_SAVE_REQUESTS / MECHTA_SAVE_OUTPUTS
+request-*.json
+output-*.txt

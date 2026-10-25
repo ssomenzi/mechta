@@ -1,0 +1,8 @@
+{"STRUMENTI": [
+  {"type": "function", "function": {"name": "read", "description": "Read a file", "parameters": {"type": "object",
+    "properties": {"filePath": {"type": "string"}, "offset": {"type": "integer"}, "limit": {"type": "number"}}, "required": ["filePath"]}}},
+  {"type": "function", "function": {"name": "grep", "description": "Search <pattern> & more", "parameters": {"type": "object",
+    "properties": {"pattern": {"type": "string"}, "include": {"type": "array", "items": {"type": "string"}}, "opzioni": {"type": "object", "properties": {"case": {"type": "boolean"}}}}}}},
+  {"type": "function", "function": {"name": "ora", "description": "Current time", "parameters": {"type": "object", "properties": {}}}}],
+ "STRUMENTI_UNICODE": [
+  {"type": "function", "function": {"name": "cerca", "description": "Cerca nella città — «virgolette» 你好", "parameters": {"type": "object", "properties": {"q": {"type": "string"}}}}}]}

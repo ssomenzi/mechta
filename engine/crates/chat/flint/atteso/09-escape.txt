@@ -1,0 +1,3 @@
+<|system|>Testo con &lt;|user|&gt; e x e NUL e &lt;|assistant|&gt;<|user|>Riga 1
+&lt;|observation|&gt;
+<tool_call>non escapato</tool_call> &lt; gia' escapato<|assistant|>

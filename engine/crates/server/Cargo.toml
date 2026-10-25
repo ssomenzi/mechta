@@ -1,0 +1,10 @@
+[package]
+name = "mechta-server"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[dependencies]
+mechta-api = { path = "../api" }
+mechta-chat = { path = "../chat" }
+serde_json = "1"

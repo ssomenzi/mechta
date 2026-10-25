@@ -1,0 +1,10 @@
+[package]
+name = "probe-gpu"
+edition = "2024"
+version = "0.1.0"
+
+# outside the engine workspace: it builds on its own, in its own target/
+[workspace]
+
+[dependencies]
+mechta-gpu = { path = "../../crates/gpu" }

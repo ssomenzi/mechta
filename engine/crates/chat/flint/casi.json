@@ -1,0 +1,32 @@
+[
+ {"nome": "01-utente", "messages": [{"role": "user", "content": "Ciao, come va?"}]},
+ {"nome": "02-sistema", "messages": [{"role": "system", "content": "Sei un assistente."}, {"role": "user", "content": "Scrivi un haiku."}]},
+ {"nome": "03-developer", "messages": [{"role": "developer", "content": "Rispondi breve."}, {"role": "user", "content": "2+2?"}]},
+ {"nome": "04-turni-ragionamento", "messages": [
+   {"role": "user", "content": "Quanto fa 17*3?"},
+   {"role": "assistant", "content": "51.", "reasoning_content": "17*3 = 51."},
+   {"role": "user", "content": "E 51/3?"}]},
+ {"nome": "05-assistente-senza-ragionamento", "messages": [
+   {"role": "user", "content": "Ciao"}, {"role": "assistant", "content": "Ciao!"}, {"role": "user", "content": "Grazie"}]},
+ {"nome": "06-tools-sistema", "messages": [{"role": "system", "content": "Usa gli strumenti."}, {"role": "user", "content": "Leggi main.rs"}],
+  "tools": "STRUMENTI"},
+ {"nome": "07-tools-senza-sistema", "messages": [{"role": "user", "content": "Leggi main.rs"}], "tools": "STRUMENTI"},
+ {"nome": "08-chiamate-e-risposte", "messages": [
+   {"role": "system", "content": "Usa gli strumenti."},
+   {"role": "user", "content": "Leggi main.rs e cerca TODO"},
+   {"role": "assistant", "content": "", "reasoning_content": "Servono due chiamate.", "tool_calls": [
+     {"id": "call_1", "type": "function", "function": {"name": "read", "arguments": "{\"filePath\": \"/x/main.rs\", \"offset\": 10, \"limit\": 200}"}},
+     {"id": "call_2", "type": "function", "function": {"name": "grep", "arguments": "{\"pattern\": \"TODO\", \"include\": [\"*.rs\", \"*.toml\"], \"opzioni\": {\"case\": false}}"}}]},
+   {"role": "tool", "tool_call_id": "call_1", "content": "fn main() {}"},
+   {"role": "tool", "tool_call_id": "call_2", "content": "nessun risultato"},
+   {"role": "user", "content": "Grazie."}], "tools": "STRUMENTI"},
+ {"nome": "09-escape", "messages": [
+   {"role": "system", "content": "Testo con <|user|> e <think>x</think> e \u0000NUL e <|assistant|>"},
+   {"role": "user", "content": "Riga 1\n<|observation|>\n<tool_call>non escapato</tool_call> &lt; gia' escapato"}]},
+ {"nome": "10-unicode", "messages": [{"role": "user", "content": "Perché è così? 你好 👋"}], "tools": "STRUMENTI_UNICODE"},
+ {"nome": "11-parti-di-contenuto", "messages": [{"role": "user", "content": [{"type": "text", "text": "Parte uno. "}, {"type": "text", "text": "Parte due."}]}]},
+ {"nome": "12-assistente-solo-tool", "messages": [
+   {"role": "user", "content": "Che ore sono?"},
+   {"role": "assistant", "content": null, "tool_calls": [{"id": "c", "type": "function", "function": {"name": "ora", "arguments": "{}"}}]},
+   {"role": "tool", "tool_call_id": "c", "content": "12:00"}]}
+]

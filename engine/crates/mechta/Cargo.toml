@@ -1,0 +1,17 @@
+[package]
+name = "mechta"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[dependencies]
+mechta-gguf = { path = "../gguf" }
+tokenizers = { version = "0.22.2", default-features = false, features = ["fancy-regex"] }
+mechta-gpu = { path = "../gpu" }
+half = "2"
+mechta-api = { path = "../api" }
+mechta-server = { path = "../server" }
+
+[dev-dependencies]
+# the shaders are checked on the CPU by `cargo test` (wgsl_check), before any run on the GPU
+naga = { version = "=30.0.1", features = ["wgsl-in"] }

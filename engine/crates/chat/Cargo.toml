@@ -1,0 +1,12 @@
+[package]
+name = "mechta-chat"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[dependencies]
+# preserve_order: the order of the keys (tools schema, arguments) stays the client's, as in Python
+serde_json = { version = "1", features = ["preserve_order"] }
+serde = "1"
+minijinja = { version = "2.24", features = ["preserve_order", "json", "loop_controls"] }
+minijinja-contrib = { version = "2.24", features = ["pycompat"] }

@@ -1,0 +1,92 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "provider": {
+    "mechta": {
+      "npm": "@ai-sdk/openai-compatible",
+      "name": "mechta (locale)",
+      "options": {
+        "baseURL": "http://127.0.0.1:4131/v1"
+      },
+      "models": {
+        "qwen3.6-35b-a3b": {
+          "name": "Qwen3.6 35B A3B MTP (mechta)",
+          "tool_call": true,
+          "reasoning": true,
+          "interleaved": {
+            "field": "reasoning_content"
+          },
+          "limit": {
+            "context": 131072,
+            "output": 32768
+          }
+        },
+        "qwen3.6-35b-a3b-codice": {
+          "name": "Qwen3.6 35B A3B MTP (mechta, codice, senza ragionamento)",
+          "tool_call": true,
+          "reasoning": false,
+          "limit": {
+            "context": 131072,
+            "output": 32768
+          },
+          "options": {
+            "chat_template_kwargs": {
+              "enable_thinking": false
+            }
+          }
+        },
+        "tiel-coder-35b-a3b": {
+          "name": "Tiel-Coder 35B A3B MTP (mechta)",
+          "tool_call": true,
+          "reasoning": true,
+          "interleaved": {
+            "field": "reasoning_content"
+          },
+          "limit": {
+            "context": 131072,
+            "output": 32768
+          }
+        },
+        "tiel-coder-35b-a3b-codice": {
+          "name": "Tiel-Coder 35B A3B MTP (mechta, codice, senza ragionamento)",
+          "tool_call": true,
+          "reasoning": false,
+          "limit": {
+            "context": 131072,
+            "output": 32768
+          },
+          "options": {
+            "chat_template_kwargs": {
+              "enable_thinking": false
+            }
+          }
+        },
+        "ornith-1.5-35b-a3b-apex": {
+          "name": "Ornith 1.5 35B A3B APEX MTP (mechta)",
+          "tool_call": true,
+          "reasoning": true,
+          "interleaved": {
+            "field": "reasoning_content"
+          },
+          "limit": {
+            "context": 131072,
+            "output": 32768
+          }
+        },
+        "ornith-1.5-35b-a3b-apex-codice": {
+          "name": "Ornith 1.5 35B A3B APEX MTP (mechta, codice, senza ragionamento)",
+          "tool_call": true,
+          "reasoning": false,
+          "limit": {
+            "context": 131072,
+            "output": 32768
+          },
+          "options": {
+            "chat_template_kwargs": {
+              "enable_thinking": false
+            }
+          }
+        }
+      }
+    }
+  }
+}

@@ -1,0 +1,11 @@
+<|system|>
+# Tools
+
+You may call one or more functions to assist with the user query.
+
+You are provided with function signatures within <tools></tools> XML tags:
+<tools>{"name": "read", "description": "Read a file", "parameters": {"type": "object", "properties": {"filePath": {"type": "string"}, "offset": {"type": "integer"}, "limit": {"type": "number"}}, "required": ["filePath"]}}{"name": "grep", "description": "Search <pattern> & more", "parameters": {"type": "object", "properties": {"pattern": {"type": "string"}, "include": {"type": "array", "items": {"type": "string"}}, "opzioni": {"type": "object", "properties": {"case": {"type": "boolean"}}}}}}{"name": "ora", "description": "Current time", "parameters": {"type": "object", "properties": {}}}</tools>
+
+For each function call, output the function name and arguments within the following XML format:
+<tool_call>{function-name}<arg_key>{arg-key-1}</arg_key><arg_value>{arg-value-1}</arg_value>...</tool_call>
+<|user|>Leggi main.rs<|assistant|>

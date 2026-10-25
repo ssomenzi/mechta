@@ -1,0 +1,128 @@
+# mechta — usage
+
+## Running the server
+`mechta serve` starts an OpenAI-compatible server (default `127.0.0.1:4131`). Three environment variables are
+required; there are no default paths in the code:
+
+| variable | meaning |
+|---|---|
+| `MECHTA_MODEL=<file.gguf>` | the model (qwen35moe with tensor types Q8_0, Q3_K, Q4_K, Q6_K, F32; or Flint). Tested: Qwen3.6-35B-A3B UD-Q4_K_S, Tiel-Coder-35B-A3B |
+| `MECHTA_TOKENIZER=<tokenizer.json>` | the tokenizer of that model; the repository ships `tokenizers/qwen3.6-tokenizer.json` and `tokenizers/flint-tokenizer.json` |
+| `MECHTA_CACHE=<directory>` | where the roots (prefix cache across sessions) are saved; created if missing |
+
+```
+cargo build --release            # in engine/
+MECHTA_MODEL=/path/to/model.gguf \
+MECHTA_TOKENIZER=../tokenizers/qwen3.6-tokenizer.json \
+MECHTA_CACHE=/path/to/prefix-cache \
+target/release/mechta serve [--ctx N]
+```
+Context size: `--ctx N` or `MECHTA_CTX=N`, default 65536; allowed values are multiples of 1024 from 4096 to 262144.
+Before loading the model the server checks memory: if the context does not fit, it does not start and says the
+largest context that fits. The same check alone, without the GPU: `mechta check-memory [ctx]`.
+Estimate (f16 KV cache): 64K ~23.6 GB, 128K ~25.3 GB, 192K ~26.9 GB, 256K ~28.5 GB (measured at 128K: 24.8 GB).
+At load time the log prints the memory actually taken ("GPU memory taken"), next to the estimate.
+With 64K of context the server uses about 17 GB of VRAM and 10.6 GB of GTT: do not load anything else on the GPU.
+
+## The convenience script `engine/mechta-serve.sh`
+It runs the server as a systemd user unit `mechta-serve`, so that it does not depend on a terminal:
+```
+engine/mechta-serve.sh start    # checks, then starts the unit; the model loads in ~10 s
+engine/mechta-serve.sh stop
+engine/mechta-serve.sh status   # state of the unit and of the port
+engine/mechta-serve.sh log      # live log (one "prefill:" line and one "chat" line per request)
+```
+`start` stops with a message if `MECHTA_MODEL`, `MECHTA_TOKENIZER` or `MECHTA_CACHE` is missing or unreadable, if the
+binary is not built, if the port is already in use, or if `mechta check-memory` says the context does not fit.
+If `MECHTA_PREFLIGHT=<command>` is set, that command is run before the start as a machine check (for example of
+GPU health): the server starts only if it exits with 0. The script passes on the variables of the table below and sets
+`MECHTA_RESERVE_GB=2`.
+
+## Environment variables (reference)
+| variable | effect |
+|---|---|
+| `MECHTA_MODEL`, `MECHTA_TOKENIZER`, `MECHTA_CACHE` | **required**: the GGUF, its tokenizer.json, the roots folder (see above) |
+| `MECHTA_CTX=N` | context in tokens (default 65536; also `mechta serve --ctx N`) |
+| `MECHTA_ADDRESS=host:port` | listen address (default `127.0.0.1:4131`; `0.0.0.0:4131` opens it to the network: only behind a firewall and, preferably, with `MECHTA_API_KEY`) |
+| `MECHTA_API_KEY=<key>` | if set, `/v1/*` requires `Authorization: Bearer <key>`, otherwise 401; `/health` stays open. `mechta-chat` reads the same variable |
+| `MECHTA_MODEL_ID=<id>` | the model id in `/v1/models` (default: the file name in lowercase, cut at `-mtp` or `-ud-`, e.g. `qwen3.6-35b-a3b`) |
+| `MECHTA_THINKING=no` | reasoning off by default (per request: `chat_template_kwargs.enable_thinking`) |
+| `MECHTA_THINK_BUDGET=N` | limit on reasoning in tokens (default 0 = none). When the limit is reached the engine closes the reasoning with the sentence of the official Qwen method and `</think>`, and the model writes the answer. Per request: `thinking_budget` (also inside `chat_template_kwargs`). Test: `mechta test-budget 256` |
+| `MECHTA_KV=f16\|f32\|q8` | KV cache format (default f16: same quality as f32, faster at long context) |
+| `MECHTA_FLINT_KV=f16` | K/V cache of a Flint model in f16 (default f32) |
+| `MECHTA_PREFILL_ATTN=mx\|fa\|fd4` | prefill attention: `mx` (default with the f16 KV cache: flash attention on the matrix units, prefill +6% at 12.6K up to +45% at 93K compared to `fa`), `fa` (flash attention without matrix units; used with `MECHTA_KV=f32` or `q8`), `fd4` (the older kernel). The startup log prints the choice, e.g. `prefill attention: attn_fa_mx (matrix units)` |
+| `MECHTA_ROOT=no` | no root shared between sessions |
+| `MECHTA_ROOTS=N` | roots kept per KV format (default 6) |
+| `MECHTA_MTP=no` | no MTP (multi-token prediction) |
+| `MECHTA_MTP_TAIL=N` | single-step tail tokens for the MTP cache (default 8) |
+| `MECHTA_MTP_ACCEPT=exact\|greedy` | acceptance rule for MTP drafts (default exact; greedy = like ds4) |
+| `MECHTA_DRAFT_HEAD=no\|<file>` | MTP drafts with the full output head (default: reduced to the 32.6K tokens of `engine/draft-head.tsv`, +5-10% with the same acceptance); a file name selects another token list |
+| `MECHTA_ATTN2=c\|fd2\|old` | older double-step attention kernels (default `attn_fd2h`, 4 rows of V in flight, 18% faster than `c` = `attn_fd2c`) |
+| `MECHTA_ATTN_PIECES=N` | attention dispatches per submit in the prefill (default 2: the desktop stays responsive) |
+| `MECHTA_RESERVE_GB=N` | VRAM kept free while the weights load (default 0; the script sets 2) |
+| `MECHTA_TITLES=engine` | session titles are generated by the model (default: the first words of the question, without the model) |
+| `MECHTA_KEEPALIVE=no` | no SSE comments. By default one comment every 10 s of silence, also during generation (opencode closes the stream after 300 s without bytes, and a long tool call is held back by the parser until it is complete) |
+| `MECHTA_SAVE_REQUESTS=<folder>` | saves the body of every request (`request-<n>.json`) |
+| `MECHTA_SAVE_OUTPUTS=<folder>` | saves the raw model text of every request, before the parser (`output-<n>.txt`) |
+
+The remaining `MECHTA_*` variables select kernel variants for measurements only: see `PARAMETERS.md` and
+`CALIBRATION.md`.
+
+Sampling comes from the request fields (`temperature`, `top_p`, `top_k`, `seed`, `max_tokens`); without them:
+temperature 0.6, top_p 0.95, top_k 20. `temperature: 0` = always the most likely token.
+
+## opencode
+Copy the `mechta` provider block of `engine/opencode-mechta.json` into your opencode configuration. Each model has two
+entries: one with reasoning on (for questions and analysis) and one with the `-codice` suffix
+(`chat_template_kwargs.enable_thinking: false`, for writing code). With reasoning on, on long files the model sometimes
+plans for 32K tokens without writing. opencode always asks for at most 32000 tokens per response, whatever
+`limit.output` is. If `MECHTA_API_KEY` is set, add the key to the provider options.
+
+## What to expect
+Measured on a Radeon 780M mini PC (DDR5) with Qwen3.6-35B-A3B UD-Q4_K_S:
+
+| case | expected |
+|---|---|
+| first session with a new system prompt | cold prefill, once: ~150-210 t/s (7,250 tokens in 48 s) |
+| new session with the root already saved | root reload 25-45 ms, then only the new tokens |
+| next turn in a conversation | ~0.8 s fixed + ~7-9 ms per new token: 14 tokens 1.1 s · 64 tokens 1.3 s · 210 tokens 2.5 s · 913 tokens 7.2 s |
+| generation | 30.4 t/s at 12.7K · 28.3 at 28K · 24.9 at 44K · 17.7 at 114K |
+
+About 0.4 s of the fixed part is the 8-token tail (MTP cache, `MECHTA_MTP_TAIL`). The rest of the turn grows with the
+new tokens the client sends (question, files read, command outputs): the part of the conversation already read is
+not read again.
+
+## Roots per prompt
+One root (the state after the system prompt) is saved for every long system message (>= 2048 tokens), per KV format
+and per model: `$MECHTA_CACHE/root-<kv>-<model hash>-<prompt hash>.bin`, hashes FNV-1a. At every request the server
+looks for the root of its prompt and loads it from disk if it is not already in memory (~25-45 ms instead of redoing
+the prefill). It keeps `MECHTA_ROOTS` of them (default 6) per format; the least recently used ones are deleted.
+
+## Chat from the terminal: `mechta-chat`
+`engine/target/release/mechta-chat` (crate `crates/tui`) chats with the server's model without opencode.
+- Keys: Enter sends · Alt+Enter new line · Esc stops the answer · Ctrl+T shows/hides the reasoning · Ctrl+C quits.
+- Scrolling: wheel, ↑/↓, PgUp/PgDn, Home/End (scrolling up during an answer keeps the view still).
+- Copying (uses `wl-copy`): "answer" / "question" icons on the border of the box, Ctrl+Y, `/copy`, `/copy q`. Mouse
+  selection: drag in the chat; holding the pointer on the top or bottom edge scrolls; on release the text goes to the
+  clipboard ("selection copied"). Esc removes the highlight. Shift+drag remains the terminal's own selection (visible
+  part only). `MECHTA_CHAT_CLIPBOARD_FILE=<file>` writes the copied text to a file instead.
+- Commands: `/new`, `/system <text>`, `/think on|off`, `/copy [q]`, `/help`, `/quit`.
+- Reasoning starts as the server default; `--think on|off` forces it. The right side of the status line shows the
+  context used.
+- Every chat is saved in `~/.local/share/mechta/chats/chat-<start time>.json`.
+- `MECHTA_CHAT_ADDR=host:port` connects to another server (default `127.0.0.1:4131`).
+
+## Numerical check of a variant
+- `mechta logit-dump <text> <prefill> <steps> <out.bin> [single|double]`: logits on real text, for the variant chosen
+  with the environment variables (`MECHTA_KV`, `MECHTA_PREFILL_ATTN`, `MECHTA_PREFILL_BLOCK`, ...). `double` uses the
+  double step of MTP generation. Uses the GPU (loads the model).
+- `mechta kl <ref.bin> <var.bin> [limits]`: mean / p99 / max KL, first-choice agreement, NLL of both. CPU only. Limits
+  take the form `mean<=X`, `median<=X`, `top1>=X`; with limits it prints PASS or FAIL (exit code 1 on FAIL).
+- Limits used to accept a variant: on code `median<=0.001 top1>=85`, on English prose `mean<=0.01` (prefill 16,384
+  tokens, 256 double steps).
+
+## If something goes wrong
+- The server does not start: `mechta-serve.sh start` (or `mechta serve`) prints the reason (missing variable, memory,
+  machine check, port in use).
+- Slow answers on the first turn: look at the `prefill:` line in the log (root used or not).
+- After a GPU hang: run the machine check before retrying; usually a reboot is needed.
