@@ -7,6 +7,10 @@ such as opencode can use it as a local provider.
 It is a personal project and a challenge: how far can a small engine go when it is built for exactly one model on
 exactly one machine, instead of being a general runner like llama.cpp.
 
+If you want to know how mechta was born and how it was built, step by step, I am telling the story in a series of
+posts on my blog, starting with
+[mechta: a Rust LLM engine for Qwen3.6 on the Radeon 780M](https://stefanosomenzi.com/rust-llm-inference-engine-qwen-radeon-780m/).
+
 ## What it does
 
 - **OpenAI-compatible server**: `/v1/chat/completions` with streaming, tool calls, reasoning (`reasoning_content`)
