@@ -144,6 +144,22 @@ fn copy(@builtin(global_invocation_id) gid: vec3<u32>) {
   o[p.extra + i] = a[i];
 }
 
+// Copy with an input offset: o[extra + i] = a[step_a + i], n values (quad.rs: h of the last MTP row -> chain input).
+@compute @workgroup_size(64)
+fn copy_at(@builtin(global_invocation_id) gid: vec3<u32>) {
+  let i = gid.x; if (i >= p.n) { return; }
+  o[p.extra + i] = a[p.step_a + i];
+}
+
+// Embedding row of a draft on the GPU (quad.rs, one submit per cycle): a = embedding rows of the reduced draft head
+// (n words each), b[0] = the draft index (argmax2 bits). o[extra + i] = a[index * n + i]; o2[flag] = the index.
+@compute @workgroup_size(64)
+fn gather_emb(@builtin(global_invocation_id) gid: vec3<u32>) {
+  let ix = bitcast<u32>(b[0]); let i = gid.x;
+  if (i == 0u) { o2[p.flag] = b[0]; }
+  if (i < p.n) { o[p.extra + i] = a[ix * p.n + i]; }
+}
+
 // NEOX RoPE on the first 64 dimensions of `rows` heads of n = 256 (row r at a[r * step_a ..],
 // output at o[extra + r * step_o ..], to write K directly into the cache).
 // b = table [cos 0..31 | sin 0..31] for the position, computed on the CPU as in ggml.

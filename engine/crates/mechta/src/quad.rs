@@ -7,7 +7,8 @@
 //! outputs only and save their inputs. So a refused draft costs nothing to undo; before any other kind of step the
 //! pending rows go in with `flush` (commit only).
 //! Drafts: the MTP layer on the 1 + accepted rows (their K/V into its cache), head on the last row; then 2 more MTP
-//! drafts in a chain.
+//! drafts in a chain. With the reduced draft head all of it and the next step are one submit (`cycle4`): the GPU takes
+//! the embedding of each draft from a table of the head's rows (`gather_emb`), so the drafts never go through the CPU.
 //! Child module of `engine`: it uses the engine's private parts.
 use super::*;
 use std::time::Instant;
@@ -25,11 +26,13 @@ pub(super) struct Quad {
     flush: [Vec<Command>; 2],
     /// MTP draft on c = 1..=K rows (index c - 1), head on the last row
     mtp: Vec<Vec<Command>>,
+    /// one submit per cycle, per conv parity and c = 1..=K MTP rows (needs the reduced draft head): see `cycle4`
+    fused: Option<[Vec<Vec<Command>>; 2]>,
     /// RoPE tables of the K rows of the step; position uniforms of the attention layers and of the MTP layer (index N_LAYER)
     tab: wgpu::Buffer, u_pos: Vec<Option<[wgpu::Buffer; 3]>>,
-    /// RoPE table of the MTP rows (`mtp`)
-    tab_m: wgpu::Buffer,
-    /// embedding rows of the step (K rows)
+    /// RoPE table and position uniforms of the MTP rows (`mtp`) and of the 2 chained drafts of `cycle4`
+    tab_m: wgpu::Buffer, tab_c: [wgpu::Buffer; 2], u_c: [Vec<Option<[wgpu::Buffer; 3]>>; 2],
+    /// embedding rows of the step (K rows; in `cycle4` the CPU writes row 0, the GPU rows 1..K)
     emb4: wgpu::Buffer,
     /// attn_dmx2 uniform per attention layer
     u_dmx: Vec<Option<wgpu::Buffer>>,
@@ -185,12 +188,15 @@ fn block_k(of: &Factory, il: usize, c: &mut Vec<Command>, u: &Uk, k: usize, par:
 impl Quad {
     /// Builds the buffers and the programs. Needs the f16 KV cache (attn_dmx2) and the MTP layer.
     #[allow(clippy::too_many_arguments)]
-    pub(super) fn new(of: &Factory, conv: &[[wgpu::Buffer; 2]], ssm: &[wgpu::Buffer], kc: &[Option<wgpu::Buffer>], vc: &[Option<wgpu::Buffer>]) -> Self {
+    pub(super) fn new(of: &Factory, conv: &[[wgpu::Buffer; 2]], ssm: &[wgpu::Buffer], kc: &[Option<wgpu::Buffer>], vc: &[Option<wgpu::Buffer>],
+                      head_ids: &[u32]) -> Self {
         let gpu = of.gpu;
         let tab = gpu.empty_buffer("rope-k", (K * 64 * 4) as u64);
         let tab_m = gpu.empty_buffer("rope-k-mtp", (K * 64 * 4) as u64);
+        let tab_c = [gpu.empty_buffer("rope-chain", 64 * 4), gpu.empty_buffer("rope-chain", 64 * 4)];
         let u3 = || [gpu.uniform(&[0u32; 8]), gpu.uniform(&[0u32; 8]), gpu.uniform(&[0u32; 8])];
         let u_pos: Vec<Option<[wgpu::Buffer; 3]>> = (0..=N_LAYER).map(|il| (attention(il) || il == N_LAYER).then(u3)).collect();
+        let u_c = [(0..=N_LAYER).map(|il| (il == N_LAYER).then(u3)).collect::<Vec<_>>(), (0..=N_LAYER).map(|il| (il == N_LAYER).then(u3)).collect()];
         let emb_row = emb_format(of.g).1 as usize;
         let emb4 = gpu.empty_buffer("emb-k", (K * emb_row) as u64);
         let u_dmx: Vec<Option<wgpu::Buffer>> = (0..N_LAYER).map(|il| attention(il).then(|| gpu.uniform(&[0u32; 8]))).collect();
@@ -242,7 +248,38 @@ impl Quad {
         };
         let mtp: Vec<Vec<Command>> = (1..=K).map(|rows| mtp_prog(rows, a("emb_raw"), a("xn"), &u_pos, &tab_m)).collect();
         let prog = [step(0), step(1)];
-        Quad { prog, flush: [flush(0), flush(1)], mtp, tab, u_pos, tab_m, emb4, u_dmx, u_dq, u_dq0, pend: std::cell::Cell::new(0) }
+        // one submit per cycle: MTP on c rows -> d1; gather d1 (step row 1, chain input); h of row c-1 -> "hc";
+        // chain draft -> d2; gather (row 2, chain input); chain draft -> d3; gather (row 3); the step; slots -> am2[4..7]
+        // MECHTA_CYCLE4=1: on the real server it was ~3 ms per cycle SLOWER than
+        // the separate submits; off until the cause is measured
+        let fused = (!head_ids.is_empty() && std::env::var("MECHTA_CYCLE4").is_ok_and(|v| v == "1")).then(|| {
+            let te = of.g.tensor("token_embd.weight").expect("token_embd");
+            let mut rows = Vec::with_capacity(head_ids.len() * emb_row);
+            for &id in head_ids { let mut r = Vec::new(); of.g.read(te, id as u64 * emb_row as u64, emb_row as u64, &mut r).expect("read"); rows.extend_from_slice(&r); }
+            let table = gpu.buffer_byte("emb-head", &rows);
+            let hc = gpu.empty_buffer("h-chain", 2048 * 4);
+            let slot = gpu.empty_buffer("draft-slots", 4 * 4);
+            let w = (emb_row / 4) as u32;
+            let gather = |dst: &wgpu::Buffer, row: u32, s: u32| of.op("gather_emb", &[(0, &table), (1, a("am2"))], dst, Some(&slot),
+                                                                         &of.u([w, 0, 0, 0, 0, 0, s, row * w]), (w.div_ceil(64), 1, 1));
+            let chain = [mtp_prog(1, a("m_emb_raw"), &hc, &u_c[0], &tab_c[0]), mtp_prog(1, a("m_emb_raw"), a("xn"), &u_c[1], &tab_c[1])];
+            let out = of.op("copy", &[(0, &slot)], a("am2"), None, &of.u([3, 0, 0, 0, 0, 0, 0, K as u32]), (1, 1, 1));
+            let one = |par: usize, c: usize| {
+                let mut v = mtp[c - 1].clone();
+                v.push(gather(&emb4, 1, 0)); v.push(gather(a("m_emb_raw"), 0, 0));
+                v.push(of.op("copy_at", &[(0, a("xn"))], &hc, None, &of.u([2048, 0, 0, 0, 2048 * (c as u32 - 1), 0, 0, 0]), (32, 1, 1)));
+                v.extend(chain[0].iter().cloned());
+                v.push(gather(&emb4, 2, 1)); v.push(gather(a("m_emb_raw"), 0, 1));
+                v.extend(chain[1].iter().cloned());
+                v.push(gather(&emb4, 3, 2));
+                v.extend(prog[par].iter().cloned());
+                v.push(out.clone());
+                v
+            };
+            eprintln!("4-token step: one submit per cycle (draft embeddings on the GPU: {:.0} MB)", rows.len() as f64 / 1e6);
+            [(1..=K).map(|c| one(0, c)).collect::<Vec<_>>(), (1..=K).map(|c| one(1, c)).collect()]
+        });
+        Quad { prog, flush: [flush(0), flush(1)], mtp, fused, tab, u_pos, tab_m, tab_c, u_c, emb4, u_dmx, u_dq, u_dq0, pend: std::cell::Cell::new(0) }
     }
 }
 
@@ -273,7 +310,7 @@ impl Engine {
         let tb: Vec<u8> = (0..n).flat_map(|t| rope_table((pos + t) as i32)).flat_map(|v| v.to_le_bytes()).collect();
         self.gpu.write(tab, 0, &tb);
     }
-    /// Inputs of the step at `pos`: the embedding rows of the K tokens `toks`, uniforms.
+    /// Inputs of the step at `pos`: the embedding rows of `toks` (all K, or only row 0 in `cycle4`), uniforms.
     fn step_inputs(&self, toks: &[u32], pos: usize) {
         assert!(pos + K < ctx());
         let q = self.quad();
@@ -294,7 +331,7 @@ impl Engine {
         self.gpu.write(&u[1], 0, &ub([512 * c as u32, 0, 0, 0, 0, 0, 0, (q0 * 512) as u32]));
         self.gpu.write(&u[2], 0, &ub([q0 as u32 + 1, (ctx() / 128) as u32, fb(1.0 / 16.0), 0, 0, 0, 0, self.mtp_start.get()]));
     }
-    /// Inputs of the MTP on the rows `toks` at q0.. (`draft_rows`).
+    /// Inputs of the MTP on the rows `toks` at q0.. (`draft_rows`, first part of `cycle4`).
     fn mtp_inputs(&self, toks: &[u32], q0: usize) {
         let c = toks.len(); assert!((1..=K).contains(&c));
         let q = self.quad();
@@ -338,7 +375,30 @@ impl Engine {
         let (_, _, _, b) = self.gpu.run_commands_read(&self.quad().mtp[c - 1], &self.a["am2"], 4);
         self.draft_id(u32::from_le_bytes(b[..4].try_into().unwrap()))
     }
-
+    /// Whether `cycle4` is available (reduced draft head).
+    pub fn has_cycle4(&self) -> bool { self.quad.as_ref().is_some_and(|q| q.fused.is_some()) }
+    /// A whole cycle in one submit: `draft_rows(toks, q0)`, 2 drafts in a chain, then `step4` at p = q0 + toks.len() - 1
+    /// with [the last of `toks`, the 3 drafts]. The same work as those calls, without the CPU in between.
+    /// Returns (argmax of the 4 rows of the step, the 3 drafts); call `accept4` after it as after `step4`.
+    pub fn cycle4(&self, toks: &[u32], q0: usize) -> ([u32; K], [u32; K - 1]) {
+        let c = toks.len(); let p = q0 + c - 1;
+        trace::set_ctx("cycle4", p, K, 0);
+        let ti = trace::start();
+        let q = self.quad();
+        self.mtp_inputs(toks, q0);
+        for (i, u) in q.u_c.iter().enumerate() {
+            self.mtp_uniforms(u[N_LAYER].as_ref().unwrap(), q0 + c + i, 1);
+            let tb: Vec<u8> = rope_table((q0 + c + i) as i32).iter().flat_map(|v| v.to_le_bytes()).collect();
+            self.gpu.write(&q.tab_c[i], 0, &tb);
+        }
+        self.step_inputs(&toks[c - 1..], p);
+        trace::span(trace::Kind::Inputs, ti, |_| {});
+        let par = self.par.get(); self.par.set(1 - par);
+        let (prep, wait, gpu, b) = self.gpu.run_commands_read(&q.fused.as_ref().unwrap()[par][c - 1], &self.a["am2"], 4 * (2 * K - 1) as u64);
+        if let Some(v) = self.span.borrow_mut().as_mut() { v.push((prep, wait, gpu)); }
+        let w = |i: usize| u32::from_le_bytes(b[4 * i..4 * i + 4].try_into().unwrap());
+        (std::array::from_fn(w), std::array::from_fn(|i| self.draft_id(w(K + i))))
+    }
 }
 
 /// `mechta quad-check <text> <prefill> <cycles>` (deterministic test): from the same state after the
@@ -426,6 +486,56 @@ pub fn quad_check(text: &str, prefill: usize, cycles: usize) {
         mtp_ok &= dq == dr && nan == 0;
     }
     println!("MTP {}", if mtp_ok { "PASS" } else { "FAIL" });
+    // one submit per cycle (cycle4) against the separate calls (draft_rows, draft_chain, step4): greedy generation from
+    // the same photo. Criterion, written before the run: the same generated tokens, the same 3 drafts in >= 97% of the
+    // cycles, and identical step argmax rows while the drafts are identical.
+    if !m.has_cycle4() { println!("cycle4: not built (no reduced draft head)"); return; }
+    let generate = |fused: bool| -> (Vec<u32>, Vec<[u32; 3]>, Vec<[u32; K]>, Vec<f64>) {
+        m.restore_photo();
+        m.mtp_start.set(p0 as u32 + 1);
+        let y = m.step(ids[p0], p0);
+        let mut ds = [m.draft(y, p0 + 1), 0, 0];
+        let ch = m.draft_chain(ds[0], p0 + 2, 0, 2); ds[1] = ch[0]; ds[2] = ch[1];
+        let (mut pos, mut cur) = (p0 + 1, y);
+        let (mut out, mut dv, mut av, mut wall) = (vec![y], vec![], vec![], vec![]);
+        let mut a = m.step4([cur, ds[0], ds[1], ds[2]], pos);
+        *m.span.borrow_mut() = Some(vec![]);
+        for _ in 0..cycles {
+            dv.push(ds); av.push(a);
+            let mut na = 0; while na < 3 && a[na] == ds[na] { na += 1; }
+            m.accept4(na + 1);
+            let toks: Vec<u32> = ds[..na].iter().copied().chain([a[na]]).collect();
+            out.extend_from_slice(&toks);
+            pos += na + 1; cur = a[na];
+            let tw = Instant::now();
+            if fused { let (a2, d2) = m.cycle4(&toks, pos - na); a = a2; ds = d2; }
+            else {
+                ds[0] = m.draft_rows(&toks, pos - na);
+                let ch = m.draft_chain(ds[0], pos + 1, toks.len() - 1, 2); ds[1] = ch[0]; ds[2] = ch[1];
+                a = m.step4([cur, ds[0], ds[1], ds[2]], pos);
+            }
+            wall.push(tw.elapsed().as_secs_f64() * 1e3);
+        }
+        m.flush4();
+        // timing (ms, medians): the whole cycle on the CPU clock; of the step / cycle4 submit: preparation, wait, GPU span
+        let sp = m.span.borrow_mut().take().unwrap_or_default();
+        let med = |mut v: Vec<f64>| -> f64 { if v.is_empty() { return f64::NAN; } v.sort_by(|a, b| a.partial_cmp(b).unwrap()); v[v.len() / 2] };
+        println!("timing {}: cycle {:.2} ms · submit of the step: prep {:.2} wait {:.2} GPU {:.2} ms", if fused { "cycle4" } else { "separate" },
+                 med(wall.clone()), med(sp.iter().map(|x| x.0).collect()), med(sp.iter().map(|x| x.1).collect()), med(sp.iter().map(|x| x.2).collect()));
+        (out, dv, av, wall)
+    };
+    let (ts, dsep, asep, _) = generate(false);
+    let (tf, dfus, afus, _) = generate(true);
+    let n = ts.len().min(tf.len());
+    let same_tok = ts[..n] == tf[..n];
+    let first_diff = (0..n).find(|&i| ts[i] != tf[i]);
+    let k = dsep.len().min(dfus.len());
+    let same_d = (0..k).filter(|&i| dsep[i] == dfus[i]).count();
+    let first_d = (0..k).find(|&i| dsep[i] != dfus[i]).unwrap_or(k);
+    let same_a = (0..first_d).all(|i| asep[i] == afus[i]);
+    println!("cycle4: {n} tokens compared, same {same_tok} (first difference {first_diff:?}) · same 3 drafts in {same_d}/{k} cycles \
+              (first difference at cycle {first_d}) · same step rows before it {same_a}");
+    println!("cycle4 {}", if same_tok && same_d as f64 >= 0.97 * k as f64 && same_a { "PASS" } else { "FAIL" });
 }
 
 #[cfg(test)]

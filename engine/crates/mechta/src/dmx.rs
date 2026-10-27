@@ -1,5 +1,5 @@
-//! attn_dmx: decode attention on the matrix units, for a step that checks k tokens (k = 2: the double step, k = 4: the
-//! 4-token step of quad.rs). Used with the f16 KV cache.
+//! attn_dmx: decode attention on the matrix units, for a step that checks k tokens (k = 2 or 4). Kernel benchmark:
+//! `mechta dmx-bench`.
 //!
 //! Why: in decode the 8 query heads that share a KV head, times the k tokens of the step, are 8k rows that read the
 //! same K and V. With k = 4 that is a 32 x 256 by 256 x positions product: what the matrix units are for. attn_fd2h
@@ -138,4 +138,160 @@ fn q_dmx(@builtin(global_invocation_id) gid: vec3<u32>) {{
 }}
 {k1}
 {k2}"#, ops = ops_source(KvFormat::F16), k1 = dmx_kernel(1), k2 = dmx_kernel(2))
+}
+
+/// `mechta dmx-bench <positions,...> <chunk,...>`: random f16 K/V (deterministic), random Q; at each context n:
+/// attn_fd2h + merge (k = 2, today) against q_dmx + attn_dmx + merge for k = 2 and 4 and each chunk size. Checks the
+/// outputs against a CPU reference (f64) for every token and head, then times 12 runs (2 dropped), median per dispatch.
+pub fn dmx_bench(positions: &str, chunks: &str) {
+    use mechta_gpu::Gpu;
+    let gpu = Gpu::new();
+    let ns: Vec<usize> = positions.split(',').map(|s| s.trim().parse().unwrap()).collect();
+    let chs: Vec<usize> = chunks.split(',').map(|s| s.trim().parse().unwrap()).collect();
+    let ctx = 131072usize;
+    assert!(ns.iter().all(|&n| n + 64 < ctx));
+    // deterministic values: K, V ~ uniform(-1, 1) as f16, Q ~ uniform(-1, 1) f32 (scale 1/16 as the model)
+    let mut st = 0x9E3779B97F4A7C15u64;
+    let mut rnd = || { st ^= st << 13; st ^= st >> 7; st ^= st << 17; (st >> 11) as f64 / (1u64 << 53) as f64 * 2.0 - 1.0 };
+    let h16 = |x: f64| half::f16::from_f64(x);
+    let kv_words = ctx * 256;
+    let k16: Vec<half::f16> = (0..ctx * 512).map(|_| h16(rnd())).collect();
+    let v16: Vec<half::f16> = (0..ctx * 512).map(|_| h16(rnd())).collect();
+    let q: Vec<f32> = (0..4 * 4096).map(|_| rnd() as f32).collect();
+    let bytes16 = |v: &[half::f16]| -> Vec<u8> { v.iter().flat_map(|x| x.to_bits().to_le_bytes()).collect() };
+    let kc = gpu.buffer_byte("k", &bytes16(&k16));
+    let vc = gpu.buffer_byte("v", &bytes16(&v16));
+    assert_eq!(k16.len() / 2, kv_words);
+    let qr = gpu.buffer_f32("qr", &q);
+    let qp = gpu.empty_buffer("qp", (2 * 32 * 256 * 2) as u64);
+    let nb_max = ctx / chs.iter().min().unwrap().min(&256);
+    let att_p = gpu.empty_buffer("att_p", (4 * 16 * nb_max * 258 * 4) as u64);
+    let att = gpu.empty_buffer("att", (4 * 4096 * 4) as u64);
+    let src = dmx_source();
+    let pipe = |e: &str| gpu.pipeline(&src, e);
+    let (p_fd2h, p_comb, p_q, p_d1, p_d2) = (pipe("attn_fd2h"), pipe("attn_fd_combine"), pipe("q_dmx"), pipe("attn_dmx1"), pipe("attn_dmx2"));
+    let fb = |x: f32| x.to_bits();
+    // CPU reference: token t, head h, positions < n + t
+    let reference = |n: usize, k: usize| -> Vec<f64> {
+        let mut out = vec![0f64; k * 4096];
+        for tok in 0..k { for h in 0..16 {
+            let kvh = h / 8; let vis = n + tok;
+            let qv = &q[tok * 4096 + h * 256..][..256];
+            let s: Vec<f64> = (0..vis).map(|i| (0..256).map(|d| qv[d] as f64 * k16[i * 512 + kvh * 256 + d].to_f64()).sum::<f64>() / 16.0).collect();
+            let mx = s.iter().cloned().fold(f64::MIN, f64::max);
+            let w: Vec<f64> = s.iter().map(|x| (x - mx).exp()).collect(); let z: f64 = w.iter().sum();
+            for d in 0..256 { out[tok * 4096 + h * 256 + d] = (0..vis).map(|i| w[i] * v16[i * 512 + kvh * 256 + d].to_f64()).sum::<f64>() / z; }
+        } }
+        out
+    };
+    let err = |got: &[f32], want: &[f64]| -> f64 { got.iter().zip(want).map(|(a, b)| (*a as f64 - b).abs()).fold(0.0, f64::max) / want.iter().map(|x| x.abs()).fold(0.0, f64::max) };
+    let time = |cmds: &[mechta_gpu::Command]| -> Vec<f64> {
+        let mut per: Vec<Vec<f64>> = vec![vec![]; cmds.len()];
+        for it in 0..12 { let m = gpu.run_commands_measured(cmds); if it >= 2 { for (i, t) in m.gpu_ms.iter().enumerate() { per[i].push(*t); } } }
+        per.into_iter().map(|mut v| { v.sort_by(|a, b| a.partial_cmp(b).unwrap()); v[v.len() / 2] }).collect()
+    };
+    println!("dmx-bench · ctx {ctx} · K/V {:.0} MB each · times = median of 10 (one pass per dispatch), ms", (ctx * 1024) as f64 / 1e6);
+    for &n in &ns {
+        let kv_mb = (n * 2 * 2 * 256 * 2) as f64 / 1e6;   // K + V of the 2 KV heads read, f16
+        // today: attn_fd2h + merge, k = 2 (blocks of 256, merge flag 256)
+        let u = gpu.uniform(&[n as u32, (ctx / 128) as u32, fb(1.0 / 16.0), 0, 0, 0, 256, 0]);
+        let c_fd = gpu.command(&p_fd2h, &[(0, &qr), (5, &att_p), (7, &u), (9, &kc), (10, &vc)], (2, (ctx / 256) as u32, 1), "attn_fd2h".into(), 0);
+        let c_cm = gpu.command(&p_comb, &[(0, &att_p), (5, &att), (7, &u)], (16, 2, 1), "merge".into(), 0);
+        let want2 = reference(n, 2);
+        let tm = time(&[c_fd, c_cm]);
+        let got: Vec<f32> = gpu.read_f32(&att, 2 * 4096);
+        println!("n={n} k=2 attn_fd2h: {:.2} + merge {:.2} = {:.2} ms · {:.0} GB/s · error vs CPU {:.1e}", tm[0], tm[1], tm[0] + tm[1], kv_mb / tm[0], err(&got, &want2));
+        let want4 = reference(n, 4);
+        for &k in &[2usize, 4] {
+            for &ch in &chs {
+                let (m, pd) = if k == 2 { (16u32, &p_d1) } else { (32, &p_d2) };
+                let nb = (ctx / ch) as u32;
+                let uq = gpu.uniform(&[n as u32, m, 0, k as u32, 0, 0, 0, 0]);
+                let ud = gpu.uniform(&[n as u32, nb, fb(1.0 / 16.0), k as u32, 0, 0, ch as u32, 0]);
+                let cq = gpu.command(&p_q, &[(0, &qr), (5, &qp), (7, &uq)], (m, 1, 1), "q_dmx".into(), 0);
+                let cd = gpu.command(pd, &[(5, &att_p), (7, &ud), (12, &kc), (13, &qp), (14, &vc)], (2, nb, 1), "attn_dmx".into(), 0);
+                let cm = gpu.command(&p_comb, &[(0, &att_p), (5, &att), (7, &ud)], (16, k as u32, 1), "merge".into(), 0);
+                let tm = time(&[cq, cd, cm]);
+                let got: Vec<f32> = gpu.read_f32(&att, k * 4096);
+                let want = if k == 2 { &want2[..] } else { &want4[..] };
+                println!("n={n} k={k} chunk {ch}: q {:.2} + attn_dmx {:.2} + merge {:.2} = {:.2} ms · {:.0} GB/s · error vs CPU {:.1e}",
+                    tm[0], tm[1], tm[2], tm[0] + tm[1] + tm[2], kv_mb / tm[1], err(&got, want));
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn dmx_source_validates() {
+        let src = super::dmx_source();
+        let module = naga::front::wgsl::parse_str(&src).unwrap_or_else(|e| panic!("{}", e.emit_to_string(&src)));
+        naga::valid::Validator::new(naga::valid::ValidationFlags::all(), naga::valid::Capabilities::all())
+            .validate(&module).unwrap_or_else(|e| panic!("{}", e.emit_to_string(&src)));
+    }
+}
+
+/// `mechta dmx-ab <text> <checkpoints> <steps> <rounds>` (measurement, real model and real KV): prefill of the text up to
+/// each checkpoint; then (1) 8 double steps where, from the same state (photo), attn_fd2h and attn_dmx give their logits
+/// (KL and top-1 of both tokens); (2) speed: `rounds` x (block of `steps` double steps with attn_fd2h, block with
+/// attn_dmx), order swapped every round, the true tokens of the text as drafts (always accepted). Wall time of each
+/// double step (CPU preparation, submit, GPU, read back), the first 2 of each block left out.
+pub fn dmx_ab(text: &str, checkpoints: &str, steps: usize, rounds: usize) {
+    use crate::engine::{Engine, VOCAB};
+    use std::time::Instant;
+    let m = Engine::new(&crate::model_path());
+    let tk = tokenizers::Tokenizer::from_file(crate::tokenizer_path()).expect("tokenizer");
+    let ids: Vec<u32> = tk.encode(std::fs::read_to_string(text).expect("text"), false).expect("encode").get_ids().to_vec();
+    let soft = |l: &[f32]| -> Vec<f64> { let mx = l.iter().cloned().fold(f32::MIN, f32::max) as f64;
+        let e: Vec<f64> = l.iter().map(|x| (*x as f64 - mx).exp()).collect(); let z: f64 = e.iter().sum(); e.iter().map(|x| x / z).collect() };
+    let argmax = |l: &[f32]| l.iter().enumerate().max_by(|a, b| a.1.partial_cmp(b.1).unwrap()).unwrap().0;
+    m.reset();
+    let mut pos = 0;
+    for p in checkpoints.split(',').map(|s| s.trim().parse::<usize>().expect("checkpoint")) {
+        assert!(p >= pos && p + 16 + 2 * steps * 2 * rounds < ids.len(), "text too short");
+        let t = Instant::now();
+        if p > pos { m.prefill(&ids[pos..p], pos); }
+        pos = p;
+        println!("prefill to {p} in {:.0} s", t.elapsed().as_secs_f64());
+        let (mut kls, mut same) = (vec![], 0);
+        for _ in 0..8 {
+            m.photograph();
+            m.set_dmx(false); m.step2(ids[pos], ids[pos + 1], pos); let a = m.read("logits", 2 * VOCAB);
+            m.restore_photo();
+            m.set_dmx(true); m.step2(ids[pos], ids[pos + 1], pos); let b = m.read("logits", 2 * VOCAB);
+            for tok in 0..2 {
+                let (la, lb) = (&a[tok * VOCAB..(tok + 1) * VOCAB], &b[tok * VOCAB..(tok + 1) * VOCAB]);
+                let (pa, pb) = (soft(la), soft(lb));
+                kls.push(pa.iter().zip(&pb).filter(|(x, _)| **x > 0.0).map(|(x, y)| x * (x.ln() - y.max(1e-300).ln())).sum::<f64>());
+                same += (argmax(la) == argmax(lb)) as usize;
+            }
+            pos += 2;
+        }
+        kls.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        println!("  checkpoint {p}: attn_dmx against attn_fd2h on the same state, 16 tokens: KL median {:.2e} max {:.2e} · same top-1 {same}/16", kls[8], kls[15]);
+        let mut per = [vec![], vec![]];
+        let mut rounds_med = [vec![], vec![]];
+        for r in 0..rounds {
+            let order = if r % 2 == 0 { [false, true] } else { [true, false] };
+            for v in order {
+                m.set_dmx(v);
+                let mut blk = vec![];
+                for i in 0..steps {
+                    let t = Instant::now();
+                    m.step2(ids[pos], ids[pos + 1], pos);
+                    if i >= 2 { blk.push(t.elapsed().as_secs_f64() * 1e3); }
+                    pos += 2;
+                }
+                blk.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                rounds_med[v as usize].push(blk[blk.len() / 2]);
+                per[v as usize].extend(blk);
+            }
+        }
+        let med = |v: &mut Vec<f64>| { v.sort_by(|a, b| a.partial_cmp(b).unwrap()); v[v.len() / 2] };
+        let (a, b) = (med(&mut per[0]), med(&mut per[1]));
+        let range = |v: &Vec<f64>| { let mn = v.iter().cloned().fold(f64::MAX, f64::min); let mx = v.iter().cloned().fold(f64::MIN, f64::max); format!("{mn:.1}-{mx:.1}") };
+        println!("  checkpoint {p} (positions {p}..{pos}): double step attn_fd2h {a:.2} ms (round medians {}) · attn_dmx {b:.2} ms (round medians {}) · {:+.1}%",
+            range(&rounds_med[0]), range(&rounds_med[1]), 100.0 * (b - a) / a);
+    }
 }

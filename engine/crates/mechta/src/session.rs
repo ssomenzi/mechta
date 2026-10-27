@@ -196,6 +196,19 @@ impl Sampler {
 /// Passes a generated token to the caller. Returns Some(finish) if the generation must end.
 /// Thinking budget: `thinking` is true while the output is inside the reasoning; when `thought` reaches
 /// `budget` (0 = no limit) `emit` sets `cut` and stops the generation, and the caller closes the reasoning.
+/// Context n-gram draft (measurement): the longest suffix of `h` (4, 3 or 2 tokens) found earlier in `h`, most recent
+/// match first; returns (suffix length, up to `k` tokens that followed it). (0, []) if none.
+fn ngram_next(h: &[u32], k: usize) -> (usize, Vec<u32>) {
+    for n in [4usize, 3, 2] {
+        if h.len() <= n { continue; }
+        let suf = &h[h.len() - n..];
+        if let Some(i) = (0..h.len() - n).rev().find(|&i| &h[i..i + n] == suf) {
+            return (n, h[i + n..(i + n + k).min(h.len())].to_vec());
+        }
+    }
+    (0, vec![])
+}
+
 struct Output<'a> { tk: &'a tokenizers::Tokenizer, emitted: Vec<u32>, k0: usize, max: usize, piece: &'a mut dyn FnMut(&str) -> bool,
                     thinking: bool, thought: usize, budget: usize, cut: bool }
 impl Output<'_> {
@@ -332,6 +345,12 @@ impl Engine for Session {
         // draft counts only if it is the same token (same distribution as without MTP). =greedy: like the default of
         // ds4 (antirez), a draft equal to the model's top token is accepted as is; otherwise the token is sampled.
         let greedy_accept = std::env::var("MECHTA_MTP_ACCEPT").map(|v| v == "greedy").unwrap_or(false);
+        // MECHTA_DRAFT_PROBE=<file> (measurement): at the end of every MTP cycle,
+        // 2 more MTP drafts in a chain and the next 3 tokens of the context n-gram, one line per cycle; the generated
+        // tokens are written at the end. The generated text does not change.
+        let mut probe = std::env::var("MECHTA_DRAFT_PROBE").ok().filter(|_| p.mtp)
+            .map(|f| std::io::BufWriter::new(std::fs::OpenOptions::new().create(true).append(true).open(f).expect("MECHTA_DRAFT_PROBE file")));
+        let mut row1: bool;   // where draft/draft2 left the MTP state (probe only)
         let (mut cycles, mut accepted, mut steps4) = (0usize, 0usize, 0usize);
         // wall time of the MTP cycles by phase (cycles profiled per kernel are left out), and with
         // MECHTA_GEN_PROFILE=1 the GPU time of every kernel of one cycle in 8
@@ -367,10 +386,12 @@ impl Engine for Session {
                 // counts only if it is that token; the first refused draft ends the step.
                 let mut ds = [m.draft(y, start), 0, 0];
                 let ch = m.draft_chain(ds[0], start + 1, 0, 2); ds[1] = ch[0]; ds[2] = ch[1];
-                let mut pos = start;
+                let (mut pos, mut cur) = (start, y);
+                // one submit per cycle (cycle4: drafts and step together) when the reduced draft head is there
+                let fused = m.has_cycle4();
                 if pos + crate::engine::STEP4_ROWS + 2 >= ctx() { break 'g Finish::Length; }
                 let tc = Instant::now();
-                let mut a = m.step4([y, ds[0], ds[1], ds[2]], pos);
+                let mut a = m.step4([cur, ds[0], ds[1], ds[2]], pos);
                 let mut t_step = tc.elapsed().as_secs_f64() * 1e3;
                 let f = 'q: loop {
                     let ts = Instant::now();
@@ -390,16 +411,22 @@ impl Engine for Session {
                     if let Some(f) = u.emit(a[na]) { break 'q f; }
                     w_double += t_step; w_sample += t_sample; w_cycles += 1;
                     let toks: Vec<u32> = ds[..na].iter().copied().chain([a[na]]).collect();
-                    pos += na + 1;
+                    pos += na + 1; cur = a[na];
                     if pos + crate::engine::STEP4_ROWS + 2 >= ctx() { break 'q Finish::Length; }
-                    // drafts for the next step: MTP on the rows just accepted, then 2 in a chain
-                    let td = Instant::now();
-                    ds[0] = m.draft_rows(&toks, pos - na);
-                    let ch = m.draft_chain(ds[0], pos + 1, toks.len() - 1, 2); ds[1] = ch[0]; ds[2] = ch[1];
-                    w_draft += td.elapsed().as_secs_f64() * 1e3;
-                    let tq = Instant::now();
-                    a = m.step4([a[na], ds[0], ds[1], ds[2]], pos);
-                    t_step = tq.elapsed().as_secs_f64() * 1e3;
+                    let tc = Instant::now();
+                    if fused {
+                        let (a2, d2) = m.cycle4(&toks, pos - na);
+                        a = a2; ds = d2;
+                    } else {
+                        ds[0] = m.draft_rows(&toks, pos - na);
+                        let ch = m.draft_chain(ds[0], pos + 1, toks.len() - 1, 2); ds[1] = ch[0]; ds[2] = ch[1];
+                        w_draft += tc.elapsed().as_secs_f64() * 1e3;
+                        let tq = Instant::now();
+                        a = m.step4([cur, ds[0], ds[1], ds[2]], pos);
+                        t_step = tq.elapsed().as_secs_f64() * 1e3;
+                        continue;
+                    }
+                    t_step = tc.elapsed().as_secs_f64() * 1e3;
                 };
                 m.flush4();
                 break 'g f;
@@ -429,7 +456,7 @@ impl Engine for Session {
                     if let Some(f) = u.emit(d) { break 'g f; }
                     if let Some(f) = u.emit(a1) { break 'g f; }
                     let td = Instant::now();
-                    d = m.draft2(d, a1, pos);
+                    d = m.draft2(d, a1, pos); row1 = true;
                     if !prof_now { w_draft += td.elapsed().as_secs_f64() * 1e3; }
                     pos += 2; cur = a1;
                 } else {
@@ -438,15 +465,28 @@ impl Engine for Session {
                     if !prof_now { w_restore += tr.elapsed().as_secs_f64() * 1e3; }
                     if let Some(f) = u.emit(a0) { break 'g f; }
                     let td = Instant::now();
-                    d = m.draft(a0, pos + 1);
+                    d = m.draft(a0, pos + 1); row1 = false;
                     if !prof_now { w_draft += td.elapsed().as_secs_f64() * 1e3; }
                     pos += 1; cur = a0;
+                }
+                if let Some(f) = probe.as_mut() {
+                    use std::io::Write;
+                    let chain = m.draft_chain(d, pos + 1, row1 as usize, 2);
+                    let mut h = toks.clone(); h.extend_from_slice(&u.emitted);
+                    let (len, ng) = ngram_next(&h, 3);
+                    let _ = writeln!(f, "c {pos} {} {cur} {d} {} {} {len} {}", h.len(), chain[0], chain[1],
+                                     ng.iter().map(|t| t.to_string()).collect::<Vec<_>>().join(","));
                 }
                 if !prof_now { w_double += t_double; w_sample += t_sample; w_cycles += 1; }
                 else { let p = m.prof.borrow_mut().take(); *m.prof.borrow_mut() = None; acc_prof(&mut prof_sum, p); }
             }
         };
         if !u.cut {
+            if let Some(f) = probe.as_mut() {
+                use std::io::Write;
+                let _ = writeln!(f, "g {n} {}", u.emitted.iter().map(|t| t.to_string()).collect::<Vec<_>>().join(","));
+                let _ = f.flush();
+            }
             break 'all f;
         }
         // Thinking budget reached: the closing text goes to the client and into the model (with the emitted
@@ -574,6 +614,16 @@ Then a storm takes one third of the flock, rounded down. How many sheep are left
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn ngram_drafts() {
+        // suffix [3,4,5,6] seen before, followed by 7,8,9
+        assert_eq!(ngram_next(&[1, 3, 4, 5, 6, 7, 8, 9, 2, 3, 4, 5, 6], 3), (4, vec![7, 8, 9]));
+        // only [5,6] repeats: the most recent earlier match wins
+        assert_eq!(ngram_next(&[5, 6, 1, 0, 5, 6, 2, 9, 5, 6], 3), (2, vec![2, 9, 5]));
+        // match near the end: fewer than k tokens follow
+        assert_eq!(ngram_next(&[7, 7, 7], 3), (2, vec![7]));
+        assert_eq!(ngram_next(&[1, 2, 3], 3), (0, vec![]));
+    }
     #[test]
     fn model_ids() {
         assert_eq!(model_id("/x/Qwen3.6-35B-A3B-UD-Q4_K_S.gguf"), "qwen3.6-35b-a3b");

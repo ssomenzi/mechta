@@ -122,6 +122,7 @@ pub fn binding_op(e: &str) -> &'static [u32] {
               "attn_fd" | "attn_fd2" | "attn_fd2b" | "attn_fd2c" | "attn_fd2d" | "attn_fd2e" | "attn_fd2_read" | "attn_fd2_read2" | "attn_fd2f" | "attn_fd2g" | "attn_fd2cm" | "attn_fd2h" | "attn_fd2i" => &[0, 5, 7, 9, 10], "attn_fd_combine" => &[0, 5, 7],
               "conv_n" => &[0, 1, 2, 5, 6, 7], "delta_n" => &[0, 1, 2, 5, 7, 8],   // M3
               "conv_q" | "delta_q" => &[0, 1, 2, 3, 5, 6, 7, 8],                   // k-token step (quad.rs)
+              "copy_at" => &[0, 5, 7], "gather_emb" => &[0, 1, 5, 6, 7],
               "attn_fd4" | "attn_fa" => &[0, 5, 7, 9, 10],
               "attn_fa_mx" => &[5, 7, 10, 12, 13], "attn_fa_mx2" => &[5, 7, 12, 13, 14], "q_f16" => &[0, 5, 7],   // matrix units (fa_mx.wgsl)
               "attn_dmx1" | "attn_dmx2" => &[5, 7, 12, 13, 14], "q_dmx" => &[0, 5, 7],                                            // decode on the matrix units (dmx.rs)
@@ -145,7 +146,7 @@ fn attn_op(of: &Factory, c: &mut Vec<Command>, double: bool, kc: &wgpu::Buffer, 
 /// Merge flag of the double-step attention: its blocks are 256 positions.
 const ATTN2_FLAG: u32 = 256;
 /// Positions per workgroup of attn_dmx (decode on the matrix units): the fastest of 512 / 1024 / 2048 in
-/// a kernel benchmark.
+/// a kernel benchmark (dmx-bench).
 pub const DMX_CH: usize = 2048;   // the context is a multiple of 1024: the last chunk can be half, so chunks = ctx.div_ceil(DMX_CH)
 /// Attention of the double step on the matrix units (dmx.rs): Q packed to f16, attn_dmx1 (16 rows = 2 tokens x 8 heads
 /// per KV head), merge of the chunks. `ud` = this layer's uniform [n, chunks, scale, tokens, 0, 0, DMX_CH, 0].
@@ -245,7 +246,7 @@ pub struct Engine {
     /// If Some: every submit without per-dispatch measurements records (preparation, wait, GPU time from the first to the last dispatch).
     pub span: RefCell<Option<Vec<(f64, f64, f64)>>>,
     /// Double step with attn_dmx (decode attention on the matrix units, f16 cache only), its per-layer uniforms, and
-    /// whether step2 uses it (default with the f16 cache, MECHTA_ATTN2=fd2h turns it off).
+    /// whether step2 uses it (default with the f16 cache, MECHTA_ATTN2=fd2h turns it off; `set_dmx` switches it, for the A/B measurement).
     prog2_dmx: Option<[Vec<Command>; 2]>, u_dmx: Vec<Option<wgpu::Buffer>>, use_dmx: std::cell::Cell<bool>,
     /// The 4-token step (quad.rs): with the f16 cache and the MTP layer.
     quad: Option<quad::Quad>,
@@ -409,7 +410,7 @@ impl Engine {
             .map(|e| (e, gpu.pipeline(if e == "mv_f32" { include_str!("wgsl/matvec.wgsl") } else { src_mv4 }, e))).collect();
         let op = ["rmsnorm", "conv", "beta_gate", "delta", "sum", "swiglu", "moe_sum", "rope", "attn_gate", "copy", "argmax1", "argmax2",
                   "beta_gate2", "conv2", "delta2", "rope2", "swiglu16", "attn_gate16", "attn_fd", "attn_fd_combine", "conv_n", "delta_n",
-                  "attn_fd4", "attn_fa", "attn_fd2h", "conv_q", "delta_q"].into_iter()
+                  "attn_fd4", "attn_fa", "attn_fd2h", "conv_q", "delta_q", "copy_at", "gather_emb"].into_iter()
             .chain(if kv_format() == KvFormat::F32 { vec![] } else { vec!["kv_rope", "kv_rope2", "kv_copy"] })
             .map(|e| (e, gpu.pipeline(src_op, e))).collect::<HashMap<_, _>>();
         let mut op = op;
@@ -451,11 +452,11 @@ impl Engine {
                        ("qn", 4 * 4096), ("kn", 4 * 512), ("qr", 4 * 4096), ("att", 4 * 4096), ("ag", 4 * 4096), ("h2", 4 * 2048), ("lg", 4 * 256), ("probs", 4 * 256),
                        ("ids", 8), ("ids2", 8), ("ids4", 4 * 8), ("weights", 4 * 8), ("eg", 4 * 4096), ("eu", 4 * 4096), ("esw", 4 * 4096), ("ed", 4 * 16384), ("sg", 4 * 512), ("su", 4 * 512),
                        ("ssw", 4 * 512), ("sd", 4 * 2048), ("sgt", 4), ("fo", 4 * 2048), ("xn", 4 * 2048), ("logits", 4 * VOCAB), ("emb_raw", 4 * 544),
-                       ("am_v", 4 * VOCAB / 256), ("am_i", 4 * VOCAB / 256), ("am", 4), ("am2", 4),
+                       ("am_v", 4 * VOCAB / 256), ("am_i", 4 * VOCAB / 256), ("am", 4), ("am2", 8),
                        ("m_emb_raw", 544), ("m_e", 4 * 2048), ("m_cat", 4 * 4096),   // MTP layer (M4)
                        ("uniforms", 1 + 3 * 16), ("u4", 1 + 5 * 32), ("xn16", 4 * 2048), // union of the experts (2 and 4 rows); xn in f16
                        ("qdm", 2 * 32 * 256 / 2),                                    // Q packed for attn_dmx (f16 pairs, up to 4 tokens)
-                       ("att_p", if step4_on() { 4 } else { 2 } * 16 * (ctx() / 128) * 258)] {   // flash-decoding partials: 2 tokens, 4 with the
+                       ("att_p", step4_on().then_some(4).unwrap_or(2) * 16 * (ctx() / 128) * 258)] {   // flash-decoding partials: 2 tokens, 4 with the
                                                                                      // 4-token step (its MTP attention); attn_dmx needs fewer
             a.insert(n, gpu.empty_buffer(n, k as u64 * 4));
         }
@@ -580,7 +581,7 @@ impl Engine {
             let pm2 = if with_mtp { program_mtp2(&of, &conv, &conv1, &ssm, &ssm1, &kc, &vc, &u_pos2, &tab2) } else { vec![] };
             // the 4-token step (quad.rs): default, f16 cache and MTP layer
             let quad = (prefill_mx() && with_mtp && step4_on())
-                .then(|| quad::Quad::new(&of, &conv, &ssm, &kc, &vc));
+                .then(|| quad::Quad::new(&of, &conv, &ssm, &kc, &vc, &head_ids));
             // M3: the prefill program uses the `ap` buffers (same names): the same factory with the map swapped
             let ofn = Factory { a: &ap, ..of };
             // M3: one program per block size and conv parity, and its segments per layer (`end_n[ib]`). The segments
@@ -691,6 +692,8 @@ impl Engine {
     }
 
 
+    /// Measurement (A/B in one run): the double step with attn_dmx (true) or attn_fd2h (false). Needs the f16 cache.
+    pub fn set_dmx(&self, on: bool) { assert!(!on || self.prog2_dmx.is_some(), "attn_dmx needs the f16 KV cache"); self.use_dmx.set(on); }
 
     /// MTP draft (one token) with h = "xn" as it is (the state after output_norm left by the last single step, or of
     /// token 0 of the last double step): token `tok` at position `pos`. One submit, 4 bytes read. Returns the draft.
@@ -700,9 +703,10 @@ impl Engine {
         let (_, _, _, b) = self.gpu.run_commands_read(&self.prog_mtp, &self.a["am2"], 4);
         self.draft_id(u32::from_le_bytes(b[..4].try_into().unwrap()))
     }
-    /// `n` more MTP drafts in a chain after the draft `d` of position `pos` (the 4-token step), each one fed with the
-    /// MTP's own hidden state of the step before, which is in row `row` of "xn" (0 after draft, the last row after
-    /// draft_rows). K/V rows of drafts that are refused are written again by the next draft_rows before anything reads them.
+    /// Measurement (MECHTA_DRAFT_PROBE): `n` more MTP drafts in a chain after the draft `d` of position `pos`, each one
+    /// fed with the MTP's own hidden state of the step before, which is in row `row` of "xn" (1 after draft2,
+    /// 0 after draft, the last row after draft_rows). The extra K/V rows of the MTP layer are written again by the real
+    /// path before anything reads them, so the generated tokens do not change.
     pub fn draft_chain(&self, d: u32, pos: usize, row: usize, n: usize) -> Vec<u32> {
         if row > 0 { self.gpu.copies_at(&[(&self.a["xn"], 8192 * row as u64, &self.a["m_cat"], 0, 8192), (&self.a["m_cat"], 0, &self.a["xn"], 0, 8192)]); }
         let (mut d, mut out) = (d, vec![]);
@@ -851,6 +855,58 @@ impl Engine {
         let (prep, wait, gpu, b) = self.gpu.run_commands_read(prog, &self.a["am2"], 4);
         if let Some(v) = self.span.borrow_mut().as_mut() { v.push((prep, wait, gpu)); }
         u32::from_le_bytes(b[..4].try_into().unwrap())
+    }
+
+    /// Measurement (attention sparsity, `attn-dump`): one step as `step`, but run in pieces that stop before each
+    /// attention kernel, to read the rotated Q of every attention layer (16 heads x 256 f32). Same result as `step`.
+    pub fn step_q(&self, tok: u32, pos: usize) -> Vec<Vec<f32>> {
+        assert!(pos < ctx());
+        trace::set_ctx("step", pos, 1, 0);
+        self.inputs(tok, pos);
+        let prog = &self.prog[self.par.get()]; self.par.set(1 - self.par.get());
+        let (mut out, mut s) = (vec![], 0);
+        for (i, c) in prog.iter().enumerate() {
+            if c.n == "attn_fd" { self.gpu.run_commands(&prog[s..i]); s = i; out.push(self.gpu.read_f32(&self.a["qr"], 16 * 256)); }
+        }
+        self.gpu.run_commands(&prog[s..]);
+        out
+    }
+
+    /// Measurement (sparse attention quality, `sparse-check`): one step as `step`, run in pieces that stop before each
+    /// attention kernel. `select(i, q)` gets the attention layer index (0..10) and its rotated Q (16 x 256); if it
+    /// returns a mask (16 heads x CTX/128 blocks, 0 = drop the block for that head) the layer runs `masked` (attn_fd with
+    /// the mask at binding 12) instead of attn_fd. Returns the logits of the token.
+    pub fn step_masked(&self, tok: u32, pos: usize, masked: &wgpu::ComputePipeline, mask: &wgpu::Buffer,
+                       select: &mut dyn FnMut(usize, &[f32]) -> Option<Vec<u32>>) -> Vec<f32> {
+        assert!(pos < ctx());
+        self.inputs(tok, pos);
+        let prog = &self.prog[self.par.get()]; self.par.set(1 - self.par.get());
+        let (mut s, mut li) = (0, 0);
+        let layers: Vec<usize> = (0..N_LAYER).filter(|&il| attention(il)).collect();
+        for (i, c) in prog.iter().enumerate() {
+            if c.n != "attn_fd" { continue; }
+            self.gpu.run_commands(&prog[s..i]); s = i;
+            let q = self.gpu.read_f32(&self.a["qr"], 16 * 256);
+            if let Some(m) = select(li, &q) {
+                let il = layers[li];
+                let b: Vec<u8> = m.iter().flat_map(|x| x.to_le_bytes()).collect();
+                self.gpu.write(mask, 0, &b);
+                let (kc, vc) = (self.kv_buf.0[il].as_ref().unwrap(), self.kv_buf.1[il].as_ref().unwrap());
+                let u = &self.u_pos[il].as_ref().unwrap()[2];
+                let cmd = self.gpu.command(masked, &[(0, &self.a["qr"]), (5, &self.a["att_p"]), (7, u), (9, kc), (10, vc), (12, mask)], c.g, "attn_fd_mask".into(), 0);
+                self.gpu.run_commands(&[cmd]); s = i + 1;
+            }
+            li += 1;
+        }
+        self.gpu.run_commands(&prog[s..]);
+        self.read("logits", VOCAB)
+    }
+    /// Measurement: the K row of position `pos` in attention layer `li` (0..10): 2 KV heads x 256 values (f16 cache).
+    pub fn read_k_row(&self, li: usize, pos: usize) -> Vec<f32> {
+        assert_eq!(kv_format(), KvFormat::F16);
+        let il = (0..N_LAYER).filter(|&il| attention(il)).nth(li).unwrap();
+        self.gpu.read_f32_from(self.kv_buf.0[il].as_ref().unwrap(), pos * 256, 256).iter()
+            .flat_map(|w| { let b = w.to_bits(); [half::f16::from_bits(b as u16).to_f32(), half::f16::from_bits((b >> 16) as u16).to_f32()] }).collect()
     }
 
     /// M3: block prefill. Processes `toks` from positions pos0.., NB at a time, without logits (the caller then does

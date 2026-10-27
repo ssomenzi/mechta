@@ -14,6 +14,7 @@ pub struct Measure { pub prep_ms: f64, pub wait_ms: f64, pub gpu_ms: Vec<f64> }
 
 /// A dispatch already prepared (bind group created only once): it is reused at every token.
 /// `mark`: a trace group (attention) starts at this dispatch, in this layer (MECHTA_TRACE=2 writes a GPU timestamp before it).
+#[derive(Clone)]
 pub struct Command { pub p: wgpu::ComputePipeline, pub bg: wgpu::BindGroup, pub g: (u32, u32, u32), pub n: String, pub byte: u64, pub mark: Option<(trace::Kind, u8)> }
 
 pub struct Gpu { pub device: wgpu::Device, pub queue: wgpu::Queue, pub info: wgpu::AdapterInfo,
