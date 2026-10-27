@@ -538,6 +538,83 @@ pub fn quad_check(text: &str, prefill: usize, cycles: usize) {
     println!("cycle4 {}", if same_tok && same_d as f64 >= 0.97 * k as f64 && same_a { "PASS" } else { "FAIL" });
 }
 
+/// `mechta cycle-bench <text> <prefill> <cycles> <rounds>` (measurement, MECHTA_CYCLE4=1): greedy generation from the
+/// same photo with each way of running a cycle, `rounds` times alternated. Per cycle: wall time on the CPU clock and,
+/// summed over the submits of `run_commands_read`, preparation, submit call, wait after the call, map + read, GPU span.
+/// "other" = wall minus those (inputs on the CPU, write_buffer, the copies submits). Every variant must give the same
+/// tokens as the separate submits.
+pub fn cycle_bench(text: &str, prefill: usize, cycles: usize, rounds: usize) {
+    let m = Engine::new(&crate::model_path());
+    assert!(m.has_cycle4(), "cycle-bench needs MECHTA_CYCLE4=1 and the reduced draft head");
+    let tk = tokenizers::Tokenizer::from_file(crate::tokenizer_path()).expect("tokenizer");
+    let ids: Vec<u32> = tk.encode(std::fs::read_to_string(text).expect("text"), false).expect("encode").get_ids().to_vec();
+    assert!(prefill + 8 < ids.len(), "text too short");
+    let t = Instant::now();
+    m.reset(); m.prefill(&ids[..prefill], 0);
+    println!("prefill {prefill} in {:.0} s", t.elapsed().as_secs_f64());
+    let p0 = prefill;
+    m.photograph();
+    // (name, fused, split, lean)
+    let variants: [(&str, bool, usize, bool); 5] = [("separate", false, 1, false), ("cycle4", true, 1, false), ("cycle4 split4", true, 4, false),
+                                                      ("separate lean", false, 1, true), ("cycle4 lean", true, 1, true)];
+    // per variant: rows of [wall, submits, prep, submit call, wait, map, GPU, writes, write ms]
+    let mut rows: Vec<Vec<[f64; 9]>> = vec![vec![]; variants.len()];
+    let mut walls: Vec<Vec<f64>> = vec![vec![]; variants.len()];
+    let mut toks_ref: Option<Vec<u32>> = None;
+    let med = |mut v: Vec<f64>| -> f64 { v.sort_by(|a, b| a.partial_cmp(b).unwrap()); v[v.len() / 2] };
+    for r in 0..rounds {
+        for (iv, &(name, fused, split, lean)) in variants.iter().enumerate() {
+            m.gpu.split.set(split); m.gpu.lean.set(lean);
+            m.restore_photo();
+            m.mtp_start.set(p0 as u32 + 1);
+            let y = m.step(ids[p0], p0);
+            let mut ds = [m.draft(y, p0 + 1), 0, 0];
+            let ch = m.draft_chain(ds[0], p0 + 2, 0, 2); ds[1] = ch[0]; ds[2] = ch[1];
+            let (mut pos, mut cur) = (p0 + 1, y);
+            let mut out = vec![y];
+            let mut a = m.step4([cur, ds[0], ds[1], ds[2]], pos);
+            let mut wall_r = vec![];
+            for _ in 0..cycles {
+                let mut na = 0; while na < 3 && a[na] == ds[na] { na += 1; }
+                m.accept4(na + 1);
+                let toks: Vec<u32> = ds[..na].iter().copied().chain([a[na]]).collect();
+                out.extend_from_slice(&toks);
+                pos += na + 1; cur = a[na];
+                *m.gpu.log.borrow_mut() = Some(vec![]); m.gpu.writes.set((0, 0.0));
+                let tw = Instant::now();
+                if fused { let (a2, d2) = m.cycle4(&toks, pos - na); a = a2; ds = d2; }
+                else {
+                    ds[0] = m.draft_rows(&toks, pos - na);
+                    let ch = m.draft_chain(ds[0], pos + 1, toks.len() - 1, 2); ds[1] = ch[0]; ds[2] = ch[1];
+                    a = m.step4([cur, ds[0], ds[1], ds[2]], pos);
+                }
+                let wall = tw.elapsed().as_secs_f64() * 1e3;
+                let l = m.gpu.log.borrow_mut().take().unwrap();
+                let s = |k: usize| l.iter().map(|x| x[k]).sum::<f64>();
+                let (nw, wms) = m.gpu.writes.get();
+                rows[iv].push([wall, l.len() as f64, s(0), s(1), s(2), s(3), s(4), nw as f64, wms]);
+                wall_r.push(wall);
+            }
+            m.flush4();
+            m.gpu.split.set(1); m.gpu.lean.set(false);
+            walls[iv].push(med(wall_r));
+            match &toks_ref { None => toks_ref = Some(out), Some(t0) => {
+                let n = t0.len().min(out.len());
+                let same = t0[..n] == out[..n];
+                if !same { println!("round {r} {name}: tokens DIFFER from the separate submits (first at {:?})", (0..n).find(|&i| t0[i] != out[i])); }
+            } }
+        }
+    }
+    println!("medians per cycle (ms), {} cycles x {rounds} rounds, from position {p0}:", cycles);
+    println!("{:<15} {:>7} {:>4} {:>6} {:>7} {:>7} {:>6} {:>7} {:>7} {:>6} {:>6}  wall per round", "variant", "wall", "subm", "prep", "submit", "wait", "map", "GPU", "other", "writes", "w ms");
+    for (iv, &(name, ..)) in variants.iter().enumerate() {
+        let col = |k: usize| med(rows[iv].iter().map(|x| x[k]).collect());
+        let other = med(rows[iv].iter().map(|x| x[0] - x[2] - x[3] - x[4] - x[5]).collect());
+        let wr: Vec<String> = walls[iv].iter().map(|w| format!("{w:.2}")).collect();
+        println!("{name:<15} {:>7.2} {:>4.0} {:>6.2} {:>7.2} {:>7.2} {:>6.2} {:>7.2} {:>7.2} {:>6.0} {:>6.2}  {}", col(0), col(1), col(2), col(3), col(4), col(5), col(6), other, col(7), col(8), wr.join(" "));
+    }
+}
+
 #[cfg(test)]
 mod tests {
     fn validate(src: &str) {

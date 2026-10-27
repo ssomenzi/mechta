@@ -200,7 +200,7 @@ pub struct Root { pub p: usize, pub ssm: Vec<Vec<f32>>, pub conv: Vec<Vec<f32>>,
 pub fn step4_on() -> bool { !std::env::var("MECHTA_STEP4").is_ok_and(|v| v == "0") }
 #[path = "quad.rs"]
 mod quad;
-pub use quad::{quad_check, K as STEP4_ROWS};
+pub use quad::{quad_check, cycle_bench, K as STEP4_ROWS};
 
 pub struct Engine {
     pub g: Gguf, pub gpu: Gpu,

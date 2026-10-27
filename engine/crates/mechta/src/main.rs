@@ -86,6 +86,9 @@ fn main() {
             }
         }
         Some("dmx-bench") => dmx::dmx_bench(&args[2], &args[3]),
+        Some("prefill-bench") => prefill_bench(&args[2], args[3].parse().expect("tokens"), args[4].parse().expect("rounds")),
+        Some("submit-bench") => submit_bench(args[2].parse().expect("iterations")),
+        Some("cycle-bench") => engine::cycle_bench(&args[2], args[3].parse().expect("prefill"), args[4].parse().expect("cycles"), args[5].parse().expect("rounds")),
         Some("quad-check") => engine::quad_check(&args[2], args[3].parse().expect("prefill"), args[4].parse().expect("cycles")),
         Some("dmx-ab") => dmx::dmx_ab(&args[2], &args[3], args[4].parse().expect("steps"), args[5].parse().expect("rounds")),
         Some("sparse-check") => attn_dump::sparse_check(&args[2], &args[3], args[4].parse().expect("steps"), &args[5]),
@@ -124,6 +127,56 @@ fn token(text: &str, reference: &str) {
     let different = ids.iter().zip(&r).filter(|(a, b)| a != b).count();
     let first = ids.iter().zip(&r).position(|(a, b)| a != b);
     println!("mechta {} tokens · llama.cpp {} tokens · different {} · first different {:?}", ids.len(), r.len(), different, first);
+}
+
+/// `mechta prefill-bench <text> <tokens> <rounds>` (measurement): the same prefill from position 0, `rounds` times;
+/// one line per round with its start and end (unix seconds, to line it up with other programs) and tokens/s.
+fn prefill_bench(text: &str, n: usize, rounds: usize) {
+    let m = engine::Engine::new(&model_path());
+    let tk = tokenizers::Tokenizer::from_file(tokenizer_path()).expect("tokenizer");
+    let ids: Vec<u32> = tk.encode(std::fs::read_to_string(text).expect("text"), false).expect("encode").get_ids().to_vec();
+    assert!(n <= ids.len(), "text too short");
+    let now = || std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs_f64();
+    for r in 0..rounds {
+        m.reset();
+        let (u0, t) = (now(), std::time::Instant::now());
+        m.prefill(&ids[..n], 0);
+        let s = t.elapsed().as_secs_f64();
+        println!("round {r} start {u0:.2} end {:.2} tokens {n} t/s {:.1}", now(), n as f64 / s);
+    }
+}
+
+/// `mechta submit-bench <iterations>` (measurement, no model): one tiny dispatch read back through `run_commands_read`,
+/// with 0 or 48 write_buffer calls of 32 bytes before it (a 4-token cycle writes about 48), on today's path and on the
+/// lean path (reused query set and readback buffer, map_buffer_on_submit). The four variants alternate.
+fn submit_bench(it: usize) {
+    let gpu = mechta_gpu::Gpu::new();
+    let src = "@group(0) @binding(0) var<storage, read_write> b: array<u32>;\n@compute @workgroup_size(64) fn tiny(@builtin(global_invocation_id) i: vec3<u32>) { b[i.x] = b[i.x] + 1u; }";
+    let p = gpu.pipeline(src, "tiny");
+    let b = gpu.empty_buffer("b", 256);
+    let cmd = [gpu.command(&p, &[(0, &b)], (1, 1, 1), "tiny".into(), 0)];
+    let us: Vec<_> = (0..48).map(|_| gpu.uniform(&[0; 8])).collect();
+    let names = ["today, 0 writes", "today, 48 writes", "lean, 0 writes", "lean, 48 writes"];
+    let mut rows: Vec<Vec<[f64; 6]>> = vec![vec![]; 4];
+    for i in 0..it + 20 {
+        for (v, row) in rows.iter_mut().enumerate() {
+            gpu.lean.set(v >= 2);
+            *gpu.log.borrow_mut() = Some(vec![]);
+            let t = std::time::Instant::now();
+            if v % 2 == 1 { for (k, u) in us.iter().enumerate() { gpu.write(u, 0, &[i as u8 ^ k as u8; 32]); } }
+            gpu.run_commands_read(&cmd, &b, 4);
+            let total = t.elapsed().as_secs_f64() * 1e3;
+            let l = gpu.log.borrow_mut().take().unwrap()[0];
+            if i >= 20 { row.push([l[0], l[1], l[2], l[3], l[4], total]); }
+        }
+    }
+    let med = |mut v: Vec<f64>| -> f64 { v.sort_by(|a, b| a.partial_cmp(b).unwrap()); v[v.len() / 2] };
+    println!("medians over {it} submits (ms): prep = encoding + query set/buffers, submit = queue.submit call, wait = until done, map = readback");
+    println!("{:<18} {:>6} {:>7} {:>6} {:>6} {:>6} {:>7}", "variant", "prep", "submit", "wait", "map", "GPU", "total");
+    for (v, row) in rows.iter().enumerate() {
+        let c = |k: usize| med(row.iter().map(|x| x[k]).collect());
+        println!("{:<18} {:>6.3} {:>7.3} {:>6.3} {:>6.3} {:>6.3} {:>7.3}", names[v], c(0), c(1), c(2), c(3), c(4), c(5));
+    }
 }
 
 /// Step 2 of M1: decodes on the GPU the first N values of a tensor and compares them with ggml.

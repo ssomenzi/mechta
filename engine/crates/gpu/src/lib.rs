@@ -22,7 +22,20 @@ pub struct Gpu { pub device: wgpu::Device, pub queue: wgpu::Queue, pub info: wgp
     /// It costs a core at 100% while the GPU works; the test machine is dedicated to mechta. MECHTA_POLL=sleeping to turn it off.
     pub poll_active: bool,
     /// MECHTA_TRACE=2 and the adapter has TIMESTAMP_QUERY_INSIDE_PASSES: timestamps at the marked dispatches.
-    pub marks: bool }
+    pub marks: bool,
+    /// Measurement (cycle-bench): one entry per `run_commands_read`, [prep, submit call, wait, map, GPU span] in ms.
+    pub log: std::cell::RefCell<Option<Vec<[f64; 5]>>>,
+    /// Measurement: the commands of `run_commands_read` split into this many command buffers of one submit (1 = today).
+    pub split: std::cell::Cell<usize>,
+    /// Measurement: `run_commands_read` reuses one query set and one readback buffer, and maps it with
+    /// `map_buffer_on_submit` (no second poll).
+    pub lean: std::cell::Cell<bool>,
+    lean_bufs: std::cell::RefCell<Option<(wgpu::QuerySet, wgpu::Buffer, wgpu::Buffer)>>,
+    /// Measurement: write_buffer calls and their CPU time (ms) since the last reset.
+    pub writes: std::cell::Cell<(u32, f64)> }
+
+/// Readback room of the lean path (bytes after the two timestamps).
+const LEAN_BYTE: u64 = 4096;
 
 /// Prefill attention on the matrix units (attn_fa_mx): used with the f16 KV cache (MECHTA_KV unset or f16), so the
 /// device is asked for cooperative matrices then (measured on the real server: prefill +6% at 12.6K up to +45% at 93K
@@ -50,7 +63,8 @@ impl Gpu {
         let experimental_features = if mx { mechta_shader::experimental_features_on() } else { wgpu::ExperimentalFeatures::disabled() };
         let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor { label: Some("mechta"), required_features: feat, required_limits: adapter.limits(), memory_hints, experimental_features, ..Default::default() }))
             .expect("request_device");
-        Gpu { device, queue, info, poll_active: std::env::var("MECHTA_POLL").map(|v| v != "sleeping").unwrap_or(true), marks }
+        Gpu { device, queue, info, poll_active: std::env::var("MECHTA_POLL").map(|v| v != "sleeping").unwrap_or(true), marks,
+              log: Default::default(), split: std::cell::Cell::new(1), lean: Default::default(), lean_bufs: Default::default(), writes: Default::default() }
     }
     /// Storage buffer with the given bytes (padded to a multiple of 4 with zeros).
     pub fn buffer_byte(&self, label: &str, byte: &[u8]) -> wgpu::Buffer {
@@ -120,36 +134,78 @@ impl Gpu {
         let tr = trace::on(); let p0 = if tr { trace::now_ns() } else { 0 };
         let t0 = std::time::Instant::now();
         let nq = 2 + self.n_marks(c); let tb = 8 * nq as u64;
-        let qs = self.device.create_query_set(&wgpu::QuerySetDescriptor { label: None, ty: wgpu::QueryType::Timestamp, count: nq as u32 });
-        let br = self.device.create_buffer(&wgpu::BufferDescriptor { label: None, size: tb, usage: wgpu::BufferUsages::QUERY_RESOLVE | wgpu::BufferUsages::COPY_SRC, mapped_at_creation: false });
-        let bl = self.device.create_buffer(&wgpu::BufferDescriptor { label: None, size: tb + byte, usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
-        let mut enc = self.device.create_command_encoder(&Default::default());
-        {
-            let tw = wgpu::ComputePassTimestampWrites { query_set: &qs, beginning_of_pass_write_index: Some(0), end_of_pass_write_index: Some(1) };
-            let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor { label: None, timestamp_writes: Some(tw) });
-            self.dispatch_all(&mut pass, c, &qs, nq);
+        let lean = self.lean.get() && nq == 2 && byte <= LEAN_BYTE;
+        if lean && self.lean_bufs.borrow().is_none() {
+            let qs = self.device.create_query_set(&wgpu::QuerySetDescriptor { label: None, ty: wgpu::QueryType::Timestamp, count: 2 });
+            let br = self.device.create_buffer(&wgpu::BufferDescriptor { label: None, size: 16, usage: wgpu::BufferUsages::QUERY_RESOLVE | wgpu::BufferUsages::COPY_SRC, mapped_at_creation: false });
+            let bl = self.device.create_buffer(&wgpu::BufferDescriptor { label: None, size: 16 + LEAN_BYTE, usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
+            *self.lean_bufs.borrow_mut() = Some((qs, br, bl));
         }
-        enc.resolve_query_set(&qs, 0..nq as u32, &br, 0);
-        enc.copy_buffer_to_buffer(&br, 0, &bl, 0, tb);
-        enc.copy_buffer_to_buffer(src, 0, &bl, tb, byte);
+        let own = (!lean).then(|| (
+            self.device.create_query_set(&wgpu::QuerySetDescriptor { label: None, ty: wgpu::QueryType::Timestamp, count: nq as u32 }),
+            self.device.create_buffer(&wgpu::BufferDescriptor { label: None, size: tb, usage: wgpu::BufferUsages::QUERY_RESOLVE | wgpu::BufferUsages::COPY_SRC, mapped_at_creation: false }),
+            self.device.create_buffer(&wgpu::BufferDescriptor { label: None, size: tb + byte, usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false })));
+        let lb = self.lean_bufs.borrow();
+        let (qs, br, bl) = match &own { Some((q, r, l)) => (q, r, l), None => { let x = lb.as_ref().unwrap(); (&x.0, &x.1, &x.2) } };
+        // the commands in `parts` command buffers (one compute pass each): timestamp at the start of the first, end of the last
+        let parts = if nq == 2 { self.split.get().clamp(1, c.len().max(1)) } else { 1 };
+        let mut encs = vec![];
+        if parts == 1 {
+            let mut enc = self.device.create_command_encoder(&Default::default());
+            {
+                let tw = wgpu::ComputePassTimestampWrites { query_set: qs, beginning_of_pass_write_index: Some(0), end_of_pass_write_index: Some(1) };
+                let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor { label: None, timestamp_writes: Some(tw) });
+                self.dispatch_all(&mut pass, c, qs, nq);
+            }
+            encs.push(enc);
+        } else {
+            let n = c.len().div_ceil(parts);
+            let k_last = c.len().div_ceil(n) - 1;
+            for (k, ch) in c.chunks(n).enumerate() {
+                let mut enc = self.device.create_command_encoder(&Default::default());
+                {
+                    let (b, e) = ((k == 0).then_some(0), (k == k_last).then_some(1));
+                    let tw = (b.is_some() || e.is_some()).then_some(wgpu::ComputePassTimestampWrites { query_set: qs, beginning_of_pass_write_index: b, end_of_pass_write_index: e });
+                    let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor { label: None, timestamp_writes: tw });
+                    for x in ch { pass.set_pipeline(&x.p); pass.set_bind_group(0, &x.bg, &[]); pass.dispatch_workgroups(x.g.0, x.g.1, x.g.2); }
+                }
+                encs.push(enc);
+            }
+        }
+        let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        {
+            let enc = encs.last_mut().unwrap();
+            enc.resolve_query_set(qs, 0..nq as u32, br, 0);
+            enc.copy_buffer_to_buffer(br, 0, bl, 0, tb);
+            enc.copy_buffer_to_buffer(src, 0, bl, tb, byte);
+            if lean { let d2 = done.clone(); enc.map_buffer_on_submit(bl, wgpu::MapMode::Read, ..tb + byte, move |r| { r.expect("map"); d2.store(true, std::sync::atomic::Ordering::Release); }); }
+        }
         let prep = t0.elapsed().as_secs_f64() * 1e3;
         let t1 = std::time::Instant::now();
         let s0 = if tr { trace::now_ns() } else { 0 };
-        self.queue.submit([enc.finish()]);
+        self.queue.submit(encs.into_iter().map(|e| e.finish()));
+        let sub = t1.elapsed().as_secs_f64() * 1e3;
         let w0 = if tr { trace::now_ns() } else { 0 };
-        self.wait();
+        if lean { while !done.load(std::sync::atomic::Ordering::Acquire) { self.device.poll(wgpu::PollType::Poll).expect("poll"); std::hint::spin_loop(); } }
+        else { self.wait(); }
         let w1 = if tr { trace::now_ns() } else { 0 };
         let wait = t1.elapsed().as_secs_f64() * 1e3;
-        let s = bl.slice(..);
-        s.map_async(wgpu::MapMode::Read, |r| r.expect("map"));
-        self.device.poll(wgpu::PollType::wait_indefinitely()).expect("poll");
+        let t2 = std::time::Instant::now();
+        let s = bl.slice(..tb + byte);
+        if !lean {
+            s.map_async(wgpu::MapMode::Read, |r| r.expect("map"));
+            self.device.poll(wgpu::PollType::wait_indefinitely()).expect("poll");
+        }
         let data = s.get_mapped_range().expect("range");
         let t: Vec<u64> = data[..tb as usize].chunks_exact(8).map(|c| u64::from_le_bytes(c.try_into().unwrap())).collect();
         let v = data[tb as usize..].to_vec();
         drop(data); bl.unmap();
+        let map = t2.elapsed().as_secs_f64() * 1e3;
         if tr { self.trace_submit(p0, s0, w0, w1, trace::now_ns(), &t, c); }
         let per = self.queue.get_timestamp_period() as f64 * 1e-6;
-        (prep, wait, t[1].saturating_sub(t[0]) as f64 * per, v)
+        let gpu = t[1].saturating_sub(t[0]) as f64 * per;
+        if let Some(l) = self.log.borrow_mut().as_mut() { l.push([prep, sub, wait - sub, map, gpu]); }
+        (prep, wait, gpu, v)
     }
     /// With the trace on it takes the path of `run_commands_span` (two timestamps, 16 bytes read back).
     pub fn run_commands(&self, c: &[Command]) -> (f64, f64) {
@@ -245,7 +301,11 @@ impl Gpu {
         self.queue.submit([enc.finish()]);
     }
     /// Writes bytes into a buffer (before the next submit).
-    pub fn write(&self, b: &wgpu::Buffer, offset: u64, byte: &[u8]) { self.queue.write_buffer(b, offset, byte); }
+    pub fn write(&self, b: &wgpu::Buffer, offset: u64, byte: &[u8]) {
+        let t = std::time::Instant::now();
+        self.queue.write_buffer(b, offset, byte);
+        let (n, ms) = self.writes.get(); self.writes.set((n + 1, ms + t.elapsed().as_secs_f64() * 1e3));
+    }
     /// Several dispatches in a single compute pass and a single submit; wgpu orders the accesses between one
     /// dispatch and the next. Waits for the end.
     pub fn batch(&self, steps: &[Step]) {
