@@ -15,8 +15,8 @@ posts on my blog, starting with
 
 - **OpenAI-compatible server**: `/v1/chat/completions` with streaming, tool calls, reasoning (`reasoning_content`)
   on or off per request, and an optional reasoning budget.
-- **Multi-token prediction (MTP)**: the model's own MTP layer drafts the next token and the engine verifies two
-  tokens per step. The output has the same distribution as without MTP.
+- **Multi-token prediction (MTP)**: the model's own MTP layer drafts the next 3 tokens and the engine verifies
+  4 tokens per step (the sure token and the 3 drafts). The output has the same distribution as without MTP.
 - **Prefix cache across sessions**: the state after a long system prompt is saved to disk and reloaded, so a new
   agent session does not recompute it.
 - **Long context**: up to 262,144 tokens, KV cache in f16 (default) or f32. A memory check before the start
@@ -29,12 +29,17 @@ posts on my blog, starting with
 ## Speed
 
 Measured on the real server with a real agent conversation (Radeon 780M, 2 GB of VRAM from the BIOS and the rest
-in GTT, Qwen3.6-35B-A3B UD-Q4_K_S, f16 KV cache, MTP on). Generation is the mean of two answers per context size:
+in GTT, Qwen3.6-35B-A3B UD-Q4_K_S, f16 KV cache, MTP on, temperature 0.6). Generation is the mean of four answers
+per context size (two server starts, two answers each):
 
-| context | 12.6K | 28K | 44K | 60K | 78K | 93K | 109K | 115K |
-|---|---|---|---|---|---|---|---|---|
-| prefill (tokens/s) | 218 | 191 | 168 | 149 | 133 | 119 | 111 | 104 |
-| generation (tokens/s) | 29.6 | 27.4 | 26.1 | 23.3 | 22.7 | 20.1 | 19.3 | 19.1 |
+| context | 12.6K | 28K | 44K | 60K | 78K | 93K | 109K |
+|---|---|---|---|---|---|---|---|
+| prefill (tokens/s) | 219 | 192 | 168 | 148 | 133 | 119 | 110 |
+| generation (tokens/s) | 34.6 | 30.9 | 29.2 | 27.6 | 26.3 | 24.5 | 24.7 |
+| generation with the double step (tokens/s) | 32.2 | 29.0 | 27.1 | 25.5 | 24.4 | 22.5 | 22.0 |
+
+The default 4-token step is 7–12% faster than the double step (the sure token and 1 draft) at temperature 0.6, and
+8–21% faster with greedy sampling.
 
 For reference, on the same machine `llama-bench` generates 23.4 tokens/s without MTP at empty context, and LM
 Studio logs 29–30 tokens/s with MTP. Method, more numbers and the correctness checks: [engine/BENCHMARKS.md](engine/BENCHMARKS.md).
