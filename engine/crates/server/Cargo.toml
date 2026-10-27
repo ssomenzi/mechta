@@ -6,5 +6,6 @@ license.workspace = true
 
 [dependencies]
 mechta-api = { path = "../api" }
+mechta-trace = { path = "../trace" }
 mechta-chat = { path = "../chat" }
 serde_json = "1"

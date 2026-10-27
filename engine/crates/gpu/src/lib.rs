@@ -1,6 +1,7 @@
 //! mechta GPU: device, buffers, kernel execution. All safe.
 #![forbid(unsafe_code)]
 pub use wgpu;
+pub use mechta_trace as trace;
 use wgpu::util::DeviceExt;
 
 /// A dispatch: pipeline, bound buffers (binding, buffer), number of workgroups.
@@ -12,12 +13,15 @@ pub struct Step<'a> { pub p: &'a wgpu::ComputePipeline, pub b: Vec<(u32, &'a wgp
 pub struct Measure { pub prep_ms: f64, pub wait_ms: f64, pub gpu_ms: Vec<f64> }
 
 /// A dispatch already prepared (bind group created only once): it is reused at every token.
-pub struct Command { pub p: wgpu::ComputePipeline, pub bg: wgpu::BindGroup, pub g: (u32, u32, u32), pub n: String, pub byte: u64 }
+/// `mark`: a trace group (attention) starts at this dispatch, in this layer (MECHTA_TRACE=2 writes a GPU timestamp before it).
+pub struct Command { pub p: wgpu::ComputePipeline, pub bg: wgpu::BindGroup, pub g: (u32, u32, u32), pub n: String, pub byte: u64, pub mark: Option<(trace::Kind, u8)> }
 
 pub struct Gpu { pub device: wgpu::Device, pub queue: wgpu::Queue, pub info: wgpu::AdapterInfo,
     /// After the submit it busy-waits instead of sleeping in the poll: -0.6 ms per token.
     /// It costs a core at 100% while the GPU works; the test machine is dedicated to mechta. MECHTA_POLL=sleeping to turn it off.
-    pub poll_active: bool }
+    pub poll_active: bool,
+    /// MECHTA_TRACE=2 and the adapter has TIMESTAMP_QUERY_INSIDE_PASSES: timestamps at the marked dispatches.
+    pub marks: bool }
 
 /// Prefill attention on the matrix units (attn_fa_mx): used with the f16 KV cache (MECHTA_KV unset or f16), so the
 /// device is asked for cooperative matrices then (measured on the real server: prefill +6% at 12.6K up to +45% at 93K
@@ -39,10 +43,13 @@ impl Gpu {
         let mx = prefill_mx_requested();
         let feat_mx = wgpu::Features::EXPERIMENTAL_COOPERATIVE_MATRIX | wgpu::Features::SHADER_F16;
         if mx { assert!(adapter.features().contains(feat_mx), "the prefill with the f16 KV cache needs cooperative matrices, and this GPU has none (MECHTA_KV=f32 works without)"); feat |= feat_mx; }
+        let marks = trace::level() >= 2 && adapter.features().contains(wgpu::Features::TIMESTAMP_QUERY_INSIDE_PASSES);
+        if marks { feat |= wgpu::Features::TIMESTAMP_QUERY_INSIDE_PASSES; }
+        if trace::level() >= 2 && !marks { eprintln!("trace: the adapter has no TIMESTAMP_QUERY_INSIDE_PASSES, no attention groups"); }
         let experimental_features = if mx { mechta_shader::experimental_features_on() } else { wgpu::ExperimentalFeatures::disabled() };
         let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor { label: Some("mechta"), required_features: feat, required_limits: adapter.limits(), memory_hints, experimental_features, ..Default::default() }))
             .expect("request_device");
-        Gpu { device, queue, info, poll_active: std::env::var("MECHTA_POLL").map(|v| v != "sleeping").unwrap_or(true) }
+        Gpu { device, queue, info, poll_active: std::env::var("MECHTA_POLL").map(|v| v != "sleeping").unwrap_or(true), marks }
     }
     /// Storage buffer with the given bytes (padded to a multiple of 4 with zeros).
     pub fn buffer_byte(&self, label: &str, byte: &[u8]) -> wgpu::Buffer {
@@ -91,7 +98,7 @@ impl Gpu {
     pub fn command(&self, p: &wgpu::ComputePipeline, b: &[(u32, &wgpu::Buffer)], g: (u32, u32, u32), n: String, byte: u64) -> Command {
         let entries: Vec<wgpu::BindGroupEntry> = b.iter().map(|(i, x)| wgpu::BindGroupEntry { binding: *i, resource: x.as_entire_binding() }).collect();
         let bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor { label: None, layout: &p.get_bind_group_layout(0), entries: &entries });
-        Command { p: p.clone(), bg, g, n, byte }
+        Command { p: p.clone(), bg, g, n, byte, mark: None }
     }
     /// All the commands in one compute pass and a single submit; waits for the end. Returns (preparation, wait) in ms.
     /// Waits for the end of the submitted work: busy wait (default), or sleeping poll (MECHTA_POLL=sleeping).
@@ -109,35 +116,43 @@ impl Gpu {
     /// `byte` bytes of `src` into a readable buffer. A single submit and a single poll per token (before: two, one for the
     /// logits). Returns (preparation ms, wait ms, GPU from the first to the last dispatch ms, bytes read).
     pub fn run_commands_read(&self, c: &[Command], src: &wgpu::Buffer, byte: u64) -> (f64, f64, f64, Vec<u8>) {
+        let tr = trace::on(); let p0 = if tr { trace::now_ns() } else { 0 };
         let t0 = std::time::Instant::now();
-        let qs = self.device.create_query_set(&wgpu::QuerySetDescriptor { label: None, ty: wgpu::QueryType::Timestamp, count: 2 });
-        let br = self.device.create_buffer(&wgpu::BufferDescriptor { label: None, size: 16, usage: wgpu::BufferUsages::QUERY_RESOLVE | wgpu::BufferUsages::COPY_SRC, mapped_at_creation: false });
-        let bl = self.device.create_buffer(&wgpu::BufferDescriptor { label: None, size: 16 + byte, usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
+        let nq = 2 + self.n_marks(c); let tb = 8 * nq as u64;
+        let qs = self.device.create_query_set(&wgpu::QuerySetDescriptor { label: None, ty: wgpu::QueryType::Timestamp, count: nq as u32 });
+        let br = self.device.create_buffer(&wgpu::BufferDescriptor { label: None, size: tb, usage: wgpu::BufferUsages::QUERY_RESOLVE | wgpu::BufferUsages::COPY_SRC, mapped_at_creation: false });
+        let bl = self.device.create_buffer(&wgpu::BufferDescriptor { label: None, size: tb + byte, usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
         let mut enc = self.device.create_command_encoder(&Default::default());
         {
             let tw = wgpu::ComputePassTimestampWrites { query_set: &qs, beginning_of_pass_write_index: Some(0), end_of_pass_write_index: Some(1) };
             let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor { label: None, timestamp_writes: Some(tw) });
-            for x in c { pass.set_pipeline(&x.p); pass.set_bind_group(0, &x.bg, &[]); pass.dispatch_workgroups(x.g.0, x.g.1, x.g.2); }
+            self.dispatch_all(&mut pass, c, &qs, nq);
         }
-        enc.resolve_query_set(&qs, 0..2, &br, 0);
-        enc.copy_buffer_to_buffer(&br, 0, &bl, 0, 16);
-        enc.copy_buffer_to_buffer(src, 0, &bl, 16, byte);
+        enc.resolve_query_set(&qs, 0..nq as u32, &br, 0);
+        enc.copy_buffer_to_buffer(&br, 0, &bl, 0, tb);
+        enc.copy_buffer_to_buffer(src, 0, &bl, tb, byte);
         let prep = t0.elapsed().as_secs_f64() * 1e3;
         let t1 = std::time::Instant::now();
+        let s0 = if tr { trace::now_ns() } else { 0 };
         self.queue.submit([enc.finish()]);
+        let w0 = if tr { trace::now_ns() } else { 0 };
         self.wait();
+        let w1 = if tr { trace::now_ns() } else { 0 };
         let wait = t1.elapsed().as_secs_f64() * 1e3;
         let s = bl.slice(..);
         s.map_async(wgpu::MapMode::Read, |r| r.expect("map"));
         self.device.poll(wgpu::PollType::wait_indefinitely()).expect("poll");
         let data = s.get_mapped_range().expect("range");
-        let t: Vec<u64> = data[..16].chunks_exact(8).map(|c| u64::from_le_bytes(c.try_into().unwrap())).collect();
-        let v = data[16..].to_vec();
+        let t: Vec<u64> = data[..tb as usize].chunks_exact(8).map(|c| u64::from_le_bytes(c.try_into().unwrap())).collect();
+        let v = data[tb as usize..].to_vec();
         drop(data); bl.unmap();
+        if tr { self.trace_submit(p0, s0, w0, w1, trace::now_ns(), &t, c); }
         let per = self.queue.get_timestamp_period() as f64 * 1e-6;
         (prep, wait, t[1].saturating_sub(t[0]) as f64 * per, v)
     }
+    /// With the trace on it takes the path of `run_commands_span` (two timestamps, 16 bytes read back).
     pub fn run_commands(&self, c: &[Command]) -> (f64, f64) {
+        if trace::on() { let (p, w, _) = self.run_commands_span(c); return (p, w); }
         let t0 = std::time::Instant::now();
         let mut enc = self.device.create_command_encoder(&Default::default());
         {
@@ -154,28 +169,34 @@ impl Gpu {
     /// Returns (preparation ms, wait ms, GPU time from the first to the last dispatch ms). The third number
     /// also contains the gaps between one dispatch and the next, which the per-dispatch measurement does not see.
     pub fn run_commands_span(&self, c: &[Command]) -> (f64, f64, f64) {
+        let tr = trace::on(); let p0 = if tr { trace::now_ns() } else { 0 };
         let t0 = std::time::Instant::now();
-        let qs = self.device.create_query_set(&wgpu::QuerySetDescriptor { label: None, ty: wgpu::QueryType::Timestamp, count: 2 });
-        let br = self.device.create_buffer(&wgpu::BufferDescriptor { label: None, size: 16, usage: wgpu::BufferUsages::QUERY_RESOLVE | wgpu::BufferUsages::COPY_SRC, mapped_at_creation: false });
-        let bl = self.device.create_buffer(&wgpu::BufferDescriptor { label: None, size: 16, usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
+        let nq = 2 + self.n_marks(c); let tb = 8 * nq as u64;
+        let qs = self.device.create_query_set(&wgpu::QuerySetDescriptor { label: None, ty: wgpu::QueryType::Timestamp, count: nq as u32 });
+        let br = self.device.create_buffer(&wgpu::BufferDescriptor { label: None, size: tb, usage: wgpu::BufferUsages::QUERY_RESOLVE | wgpu::BufferUsages::COPY_SRC, mapped_at_creation: false });
+        let bl = self.device.create_buffer(&wgpu::BufferDescriptor { label: None, size: tb, usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
         let mut enc = self.device.create_command_encoder(&Default::default());
         {
             let tw = wgpu::ComputePassTimestampWrites { query_set: &qs, beginning_of_pass_write_index: Some(0), end_of_pass_write_index: Some(1) };
             let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor { label: None, timestamp_writes: Some(tw) });
-            for x in c { pass.set_pipeline(&x.p); pass.set_bind_group(0, &x.bg, &[]); pass.dispatch_workgroups(x.g.0, x.g.1, x.g.2); }
+            self.dispatch_all(&mut pass, c, &qs, nq);
         }
-        enc.resolve_query_set(&qs, 0..2, &br, 0);
-        enc.copy_buffer_to_buffer(&br, 0, &bl, 0, 16);
+        enc.resolve_query_set(&qs, 0..nq as u32, &br, 0);
+        enc.copy_buffer_to_buffer(&br, 0, &bl, 0, tb);
         let prep = t0.elapsed().as_secs_f64() * 1e3;
         let t1 = std::time::Instant::now();
+        let s0 = if tr { trace::now_ns() } else { 0 };
         self.queue.submit([enc.finish()]);
+        let w0 = if tr { trace::now_ns() } else { 0 };
         self.wait();
+        let w1 = if tr { trace::now_ns() } else { 0 };
         let wait = t1.elapsed().as_secs_f64() * 1e3;
         let s = bl.slice(..);
         s.map_async(wgpu::MapMode::Read, |r| r.expect("map"));
         self.device.poll(wgpu::PollType::wait_indefinitely()).expect("poll");
         let t: Vec<u64> = s.get_mapped_range().expect("range").chunks_exact(8).map(|c| u64::from_le_bytes(c.try_into().unwrap())).collect();
         bl.unmap();
+        if tr { self.trace_submit(p0, s0, w0, w1, trace::now_ns(), &t, c); }
         let per = self.queue.get_timestamp_period() as f64 * 1e-6;
         (prep, wait, t[1].saturating_sub(t[0]) as f64 * per)
     }
@@ -210,8 +231,16 @@ impl Gpu {
     }
     /// Copies between buffers on the GPU, in a submit without waiting (the queue is ordered: the next submit sees them done).
     pub fn copies(&self, c: &[(&wgpu::Buffer, &wgpu::Buffer, u64)]) {
+        let p0 = if trace::on() { trace::now_ns() } else { 0 };
         let mut enc = self.device.create_command_encoder(&Default::default());
         for (s, d, n) in c { enc.copy_buffer_to_buffer(s, 0, d, 0, *n); }
+        self.queue.submit([enc.finish()]);
+        trace::span(trace::Kind::Submit, p0, |_| {});
+    }
+    /// As `copies`, with byte offsets: (source, source offset, destination, destination offset, bytes).
+    pub fn copies_at(&self, c: &[(&wgpu::Buffer, u64, &wgpu::Buffer, u64, u64)]) {
+        let mut enc = self.device.create_command_encoder(&Default::default());
+        for (s, so, d, dof, n) in c { enc.copy_buffer_to_buffer(s, *so, d, *dof, *n); }
         self.queue.submit([enc.finish()]);
     }
     /// Writes bytes into a buffer (before the next submit).
@@ -265,10 +294,56 @@ impl Gpu {
         let per = self.queue.get_timestamp_period() as f64 * 1e-6;
         Measure { prep_ms, wait_ms, gpu_ms: (0..n as usize).map(|i| t[2 * i + 1].saturating_sub(t[2 * i]) as f64 * per).collect() }
     }
+    /// Trace: the CPU spans of one submit (preparation from `p0`, submit call from `s0`, wait from `w0` to the
+    /// end of the readback `r1`) and its GPU span moved to the trace clock. `w1` = end of the wait, the first CPU
+    /// moment that follows the GPU end: it updates the clock alignment. `ticks` = GPU timestamps of start and end.
+    /// `ticks` = the resolved timestamps: [pass start, pass end, one per marked dispatch of `c` in order]. A group ends at
+    /// the next mark or at the pass end; the dispatches before the first mark belong to the group left open by the
+    /// previous submit (`trace::Ctx::open`, prefill cut inside an attention layer).
+    #[allow(clippy::too_many_arguments)]
+    fn trace_submit(&self, p0: u64, s0: u64, w0: u64, w1: u64, r1: u64, ticks: &[u64], c: &[Command]) {
+        use trace::{Event, Kind, record};
+        record(Event::new(Kind::Prep, p0, s0));
+        record(Event::new(Kind::Submit, s0, w0));
+        record(Event::new(Kind::Wait, w0, r1));
+        let Some(t) = trace::global() else { return };
+        let per = self.queue.get_timestamp_period() as f64;
+        let ns: Vec<u64> = ticks.iter().map(|&k| (k as f64 * per) as u64).collect();
+        let mut clock = t.clock.lock().unwrap();
+        clock.update(w1, ns[1]);
+        let cpu = |g: u64| clock.to_cpu(g).unwrap_or(0);
+        let mut ev = vec![Event::new(Kind::Gpu, cpu(ns[0]), cpu(ns[1]))];
+        // groups: (start ns, kind, layer), then each ends where the next starts
+        let mut g: Vec<(u64, Option<(Kind, u8)>)> = vec![(ns[0], if self.marks { trace::ctx().open } else { None })];
+        g.extend(c.iter().filter_map(|x| x.mark).zip(&ns[2..]).map(|(m, &s)| (s, Some(m))));
+        g.push((ns[1], None));
+        let (bpp, ctx) = (trace::kv_bytes_per_pos(), trace::ctx());
+        for w in g.windows(2) {
+            let Some((kind, layer)) = w[0].1 else { continue };
+            if kind == Kind::AttnEnd { continue; }
+            let mut e = Event::new(kind, cpu(w[0].0), cpu(w[1].0.max(w[0].0)));
+            e.layer = layer;
+            if kind == Kind::AttnCore { e.bytes = ctx.kv as u64 * bpp; }
+            ev.push(e);
+        }
+        drop(clock);
+        for e in ev { record(e); }
+    }
+    /// Marked dispatches of `c` that get a timestamp (0 unless MECHTA_TRACE=2 on an adapter that allows it).
+    fn n_marks(&self, c: &[Command]) -> usize { if self.marks && trace::on() { c.iter().filter(|x| x.mark.is_some()).count() } else { 0 } }
+    /// The dispatches of `c` in the pass, with a timestamp before each marked one when `nq > 2` (index 2, 3, ...).
+    fn dispatch_all(&self, pass: &mut wgpu::ComputePass, c: &[Command], qs: &wgpu::QuerySet, nq: usize) {
+        let mut j = 2u32;
+        for x in c {
+            if nq > 2 && x.mark.is_some() { pass.write_timestamp(qs, j); j += 1; }
+            pass.set_pipeline(&x.p); pass.set_bind_group(0, &x.bg, &[]); pass.dispatch_workgroups(x.g.0, x.g.1, x.g.2);
+        }
+    }
     pub fn read_f32(&self, b: &wgpu::Buffer, n: usize) -> Vec<f32> { self.read_f32_from(b, 0, n) }
     /// `n` f32 from word `da` of the buffer (compact KV cache, whose scales are after the data).
     pub fn read_f32_from(&self, b: &wgpu::Buffer, da: usize, n: usize) -> Vec<f32> {
         let size = (n * 4) as u64;
+        let p0 = if trace::on() { trace::now_ns() } else { 0 };
         let st = self.device.create_buffer(&wgpu::BufferDescriptor { label: Some("readback"), size, usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
         let mut enc = self.device.create_command_encoder(&Default::default());
         enc.copy_buffer_to_buffer(b, (da * 4) as u64, &st, 0, size);
@@ -277,7 +352,9 @@ impl Gpu {
         s.map_async(wgpu::MapMode::Read, |r| r.expect("map"));
         self.device.poll(wgpu::PollType::wait_indefinitely()).expect("poll");
         let v = s.get_mapped_range().expect("range").chunks_exact(4).map(|c| f32::from_le_bytes(c.try_into().unwrap())).collect();
-        st.unmap(); v
+        st.unmap();
+        trace::span(trace::Kind::Wait, p0, |_| {});
+        v
     }
 }
 

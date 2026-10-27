@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/gguf", "crates/shader", "crates/gpu", "crates/mechta", "crates/api", "crates/chat", "crates/server", "crates/tui"]
+members = ["crates/gguf", "crates/shader", "crates/trace", "crates/gpu", "crates/mechta", "crates/api", "crates/chat", "crates/server", "crates/tui"]
 
 [workspace.package]
 edition = "2024"

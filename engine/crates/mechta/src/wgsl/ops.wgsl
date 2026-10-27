@@ -776,3 +776,66 @@ fn attn_fd4(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_ind
     workgroupBarrier();
   }
 }
+
+// ===================== k-token verify step (quad.rs) =====================
+// The state is read once and written once per step: first the rows ACCEPTED by the previous step are applied (their
+// inputs were saved by that step), the committed state is written, then the new rows run on a copy in registers for
+// their outputs only, and their inputs are saved for the next step. p.rows = new rows (0 = commit only),
+// p.extra = pending rows, p.flag = row layout of the buffers (K = 4).
+// conv_q: a = new qkv [t*8192 + ch], b = conv1d weights, c = committed state in, d = pending raw qkv
+// [t*8192 + ch], o = output in "qk first" layout (v at flag*4096 + t*4096), o2 = committed state out,
+// o3 = this step's raw qkv saved for the next one.
+@compute @workgroup_size(64)
+fn conv_q(@builtin(global_invocation_id) gid: vec3<u32>) {
+  let ch = gid.x; if (ch >= p.n) { return; }
+  var s0 = c[ch * 3u]; var s1 = c[ch * 3u + 1u]; var s2 = c[ch * 3u + 2u];
+  let w = ch * 4u;
+  for (var t: u32 = 0u; t < p.extra; t++) { s0 = s1; s1 = s2; s2 = d[t * p.n + ch]; }
+  o2[ch * 3u] = s0; o2[ch * 3u + 1u] = s1; o2[ch * 3u + 2u] = s2;
+  for (var t: u32 = 0u; t < p.rows; t++) {
+    let fresh = a[t * p.n + ch];
+    let s = s0 * b[w] + s1 * b[w + 1u] + s2 * b[w + 2u] + fresh * b[w + 3u];
+    var oi = t * 4096u + ch;
+    if (ch >= 4096u) { oi = p.flag * 4096u + t * 4096u + ch - 4096u; }
+    o[oi] = silu(s);
+    s0 = s1; s1 = s2; s2 = fresh;
+    o3[t * p.n + ch] = fresh;
+  }
+}
+// delta_q: one workgroup per V head (32), one thread per column j. a = normalized q|k [t*4096 + ...], b = conv_q output
+// (v at flag*4096 + t*4096 + h*128 + j), c = beta|gate [t*64 + ...], d = pending inputs, o = committed state (read and
+// written once), o2 = this step's inputs saved, o3 = outputs [t*4096 + h*128 + j].
+// Saved inputs per row (DQ_ROW values): k [16 heads x 128] at 0, v [32 x 128] at 2048, beta [32] at 6144, gate [32] at 6176.
+const DQ_ROW: u32 = 6208u;
+@compute @workgroup_size(128)
+fn delta_q(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) j: u32) {
+  let h = wid.x; let kh = h % 16u;
+  let s0 = h * 16384u + j;
+  var col: array<f32, 128>;
+  for (var i: u32 = 0u; i < 128u; i++) { col[i] = o[s0 + i * 128u]; }
+  for (var t: u32 = 0u; t < p.extra; t++) {
+    let r = t * DQ_ROW; let k0 = r + kh * 128u;
+    let v = d[r + 2048u + h * 128u + j];
+    let beta = d[r + 6144u + h]; let eg = exp(d[r + 6176u + h]);
+    var sk = 0.0;
+    for (var i: u32 = 0u; i < 128u; i++) { let m = col[i] * eg; col[i] = m; sk += m * d[k0 + i]; }
+    let dl = (v - sk) * beta;
+    for (var i: u32 = 0u; i < 128u; i++) { col[i] += d[k0 + i] * dl; }
+  }
+  for (var i: u32 = 0u; i < 128u; i++) { o[s0 + i * 128u] = col[i]; }
+  for (var t: u32 = 0u; t < p.rows; t++) {
+    let q0 = t * 4096u + kh * 128u; let k0 = t * 4096u + 2048u + kh * 128u;
+    let v = b[p.flag * 4096u + t * 4096u + h * 128u + j];
+    let beta = c[t * 64u + h]; let g = c[t * 64u + 32u + h]; let eg = exp(g);
+    var sk = 0.0;
+    for (var i: u32 = 0u; i < 128u; i++) { let m = col[i] * eg; col[i] = m; sk += m * a[k0 + i]; }
+    let dl = (v - sk) * beta;
+    var sq = 0.0;
+    for (var i: u32 = 0u; i < 128u; i++) { let m = col[i] + a[k0 + i] * dl; col[i] = m; sq += m * a[q0 + i]; }
+    o3[t * 4096u + h * 128u + j] = sq * (1.0 / sqrt(128.0));
+    let r = t * DQ_ROW;
+    if (h < 16u) { o2[r + kh * 128u + j] = a[k0 + j]; }
+    o2[r + 2048u + h * 128u + j] = v;
+    if (j == 0u) { o2[r + 6144u + h] = beta; o2[r + 6176u + h] = g; }
+  }
+}

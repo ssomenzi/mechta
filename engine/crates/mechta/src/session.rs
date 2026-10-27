@@ -13,6 +13,7 @@
 //! 4. greedy generation with the MTP loop (double step, draft accepted or rejected), stop on <|im_end|> / <|endoftext|>.
 use crate::engine::{Engine as M, Root, ctx};
 use mechta_api::{Outcome, Finish, Engine, Params};
+use mechta_gpu::trace;
 use std::time::Instant;
 
 const IM_START: u32 = 248045;
@@ -168,6 +169,12 @@ impl Sampler {
         (self.state.wrapping_mul(0x2545F4914F6CDD1D) >> 11) as f64 / (1u64 << 53) as f64
     }
     pub fn sample(&mut self, logit: &[f32]) -> u32 {
+        let ts = trace::start();
+        let tok = self.sample_(logit);
+        trace::span(trace::Kind::Sample, ts, |e| e.label = "session");
+        tok
+    }
+    fn sample_(&mut self, logit: &[f32]) -> u32 {
         // the k highest logits (partial selection), then softmax with temperature, top_p cut, draw
         let mut idx: Vec<u32> = (0..logit.len() as u32).collect();
         let k = self.k.min(idx.len());
@@ -193,6 +200,12 @@ struct Output<'a> { tk: &'a tokenizers::Tokenizer, emitted: Vec<u32>, k0: usize,
                     thinking: bool, thought: usize, budget: usize, cut: bool }
 impl Output<'_> {
     fn emit(&mut self, tok: u32) -> Option<Finish> {
+        let ts = trace::start();
+        let f = self.emit_(tok);
+        trace::span(trace::Kind::Emit, ts, |e| e.label = "session");
+        f
+    }
+    fn emit_(&mut self, tok: u32) -> Option<Finish> {
         if tok == IM_END || tok == ENDOFTEXT { return Some(Finish::Stop); }
         self.emitted.push(tok);
         // incremental decoding: the tokens not yet printed are decoded; if the text ends in the middle of a character
@@ -218,6 +231,8 @@ impl Engine for Session {
 
     fn generate(&mut self, prompt: &str, p: &Params, piece: &mut dyn FnMut(&str) -> bool) -> Result<Outcome, String> {
         let t0 = Instant::now();
+        let trace_from = trace::mark();
+        let tp = trace::start();
         let toks = self.tokenize_ok(prompt)?;
         let n = toks.len();
         if n == 0 { return Err("empty prompt".into()); }
@@ -234,8 +249,10 @@ impl Engine for Session {
             let in_memory = matches!(&self.root, Some((rt, _)) if rt[..] == toks[..q]);
             let path = root_file(&toks[..q]);
             if !in_memory && std::path::Path::new(&path).exists() {
-                let tl = Instant::now();
-                if let Some(r) = read_root_file(&path) {
+                let tl = Instant::now(); let tr = trace::start();
+                let r = read_root_file(&path);
+                trace::span(trace::Kind::RootLoad, tr, |e| { e.label = "session"; e.pos = q as u32; });
+                if let Some(r) = r {
                     eprintln!("root loaded from {path}: {} tokens in {:.0} ms", r.0.len(), tl.elapsed().as_secs_f64() * 1e3);
                     self.root = Some(r);
                 }
@@ -258,6 +275,7 @@ impl Engine for Session {
         // is taken at a block boundary (otherwise the root is never taken)
         let t = match r { Some(q) if q >= t && q < n => q, _ => t };
         m.mtp_start.set((t + 1) as u32);
+        trace::span(trace::Kind::PrefixReuse, tp, |e| { e.label = "session"; e.pos = done as u32; e.ntok = n as u32; });
         let ms_rip = t0.elapsed().as_secs_f64() * 1e3;
         let (mut ms_bl, mut n_bl, mut ms_tail, mut n_tail) = (0.0, 0usize, 0.0, 0usize);
         let mut y = 0; let mut i = done;
@@ -270,7 +288,12 @@ impl Engine for Session {
                 eprintln!("new root: {i} tokens, read in {:.0} ms", tr.elapsed().as_secs_f64() * 1e3);
                 // to disk in a thread (~800 MB): the request does not wait. The copy for the thread costs little extra RAM.
                 let (t2, r2) = (tok_r.clone(), Root { p: new_root.p, ssm: new_root.ssm.clone(), conv: new_root.conv.clone(), kv: new_root.kv.clone() });
-                std::thread::spawn(move || match write_root_file(&t2, &r2) { Ok(()) => eprintln!("root saved in {}", root_file(&t2)), Err(e) => eprintln!("root NOT saved: {e}") });
+                std::thread::spawn(move || {
+                    trace::set_thread(trace::ROOT_SAVER); let ts = trace::start();
+                    let w = write_root_file(&t2, &r2);
+                    trace::span(trace::Kind::RootSave, ts, |e| { e.label = "session"; e.pos = t2.len() as u32; });
+                    match w { Ok(()) => eprintln!("root saved in {}", root_file(&t2)), Err(e) => eprintln!("root NOT saved: {e}") }
+                });
                 self.root = Some((tok_r, new_root));
             }
             if b == Some(i) { m.photograph(); self.photo_tok = toks[..i].to_vec(); }
@@ -309,7 +332,7 @@ impl Engine for Session {
         // draft counts only if it is the same token (same distribution as without MTP). =greedy: like the default of
         // ds4 (antirez), a draft equal to the model's top token is accepted as is; otherwise the token is sampled.
         let greedy_accept = std::env::var("MECHTA_MTP_ACCEPT").map(|v| v == "greedy").unwrap_or(false);
-        let (mut cycles, mut accepted) = (0usize, 0usize);
+        let (mut cycles, mut accepted, mut steps4) = (0usize, 0usize, 0usize);
         // wall time of the MTP cycles by phase (cycles profiled per kernel are left out), and with
         // MECHTA_GEN_PROFILE=1 the GPU time of every kernel of one cycle in 8
         let gen_profile = std::env::var("MECHTA_GEN_PROFILE").is_ok_and(|v| v == "1");
@@ -337,6 +360,49 @@ impl Engine for Session {
                     if let Some(f) = u.emit(a) { break 'g f; }
                     pos += 1; cur = a;
                 }
+            }
+            if m.has_step4() {
+                // the 4-token step (quad.rs, default; MECHTA_STEP4=0 for the double step): the sure token + 3 MTP drafts (1 from the rows, 2 in a
+                // chain) checked in one pass. Exact acceptance: row i is sampled (argmax when greedy) and the draft
+                // counts only if it is that token; the first refused draft ends the step.
+                let mut ds = [m.draft(y, start), 0, 0];
+                let ch = m.draft_chain(ds[0], start + 1, 0, 2); ds[1] = ch[0]; ds[2] = ch[1];
+                let mut pos = start;
+                if pos + crate::engine::STEP4_ROWS + 2 >= ctx() { break 'g Finish::Length; }
+                let tc = Instant::now();
+                let mut a = m.step4([y, ds[0], ds[1], ds[2]], pos);
+                let mut t_step = tc.elapsed().as_secs_f64() * 1e3;
+                let f = 'q: loop {
+                    let ts = Instant::now();
+                    if !camp.greedy() {
+                        let l = m.read("logits", crate::engine::STEP4_ROWS * crate::engine::VOCAB);
+                        for i in 0..crate::engine::STEP4_ROWS {
+                            a[i] = camp.sample(&l[i * crate::engine::VOCAB..(i + 1) * crate::engine::VOCAB]);
+                            if i == 3 || a[i] != ds[i] { break; }
+                        }
+                    }
+                    let t_sample = ts.elapsed().as_secs_f64() * 1e3;
+                    let mut na = 0; while na < 3 && a[na] == ds[na] { na += 1; }
+                    m.accept4(na + 1);
+                    cycles += 3; accepted += na; steps4 += 1;
+                    fed = pos + 1 + na;
+                    for &t in &ds[..na] { if let Some(f) = u.emit(t) { break 'q f; } }
+                    if let Some(f) = u.emit(a[na]) { break 'q f; }
+                    w_double += t_step; w_sample += t_sample; w_cycles += 1;
+                    let toks: Vec<u32> = ds[..na].iter().copied().chain([a[na]]).collect();
+                    pos += na + 1;
+                    if pos + crate::engine::STEP4_ROWS + 2 >= ctx() { break 'q Finish::Length; }
+                    // drafts for the next step: MTP on the rows just accepted, then 2 in a chain
+                    let td = Instant::now();
+                    ds[0] = m.draft_rows(&toks, pos - na);
+                    let ch = m.draft_chain(ds[0], pos + 1, toks.len() - 1, 2); ds[1] = ch[0]; ds[2] = ch[1];
+                    w_draft += td.elapsed().as_secs_f64() * 1e3;
+                    let tq = Instant::now();
+                    a = m.step4([a[na], ds[0], ds[1], ds[2]], pos);
+                    t_step = tq.elapsed().as_secs_f64() * 1e3;
+                };
+                m.flush4();
+                break 'g f;
             }
             let mut d = m.draft(y, start);
             let (mut pos, mut cur) = (start, y);
@@ -380,7 +446,9 @@ impl Engine for Session {
                 else { let p = m.prof.borrow_mut().take(); *m.prof.borrow_mut() = None; acc_prof(&mut prof_sum, p); }
             }
         };
-        if !u.cut { break 'all f; }
+        if !u.cut {
+            break 'all f;
+        }
         // Thinking budget reached: the closing text goes to the client and into the model (with the emitted
         // token not processed yet, if any), one step at a time like the tail of the prefill; then generation goes on.
         u.cut = false; u.budget = 0; budget_cuts += 1;
@@ -408,6 +476,9 @@ impl Engine for Session {
             eprintln!("mtp: {accepted}/{cycles} drafts accepted ({:.0}%) · accept={} · kv={}", 100.0 * accepted as f64 / cycles as f64,
                 if greedy_accept { "greedy" } else { "exact" }, crate::engine::kv_format().name());
         }
+        if steps4 > 0 { eprintln!("step4: {steps4} steps · {:.2} tokens per step", (steps4 + accepted) as f64 / steps4 as f64); }
+        if let Some(t) = trace::summary(trace_from) { eprintln!("{t}"); }
+        trace::flush();
         // unprinted remainder (only if the generation ends in the middle of a character)
         if u.k0 < u.emitted.len() && end != Finish::Cancelled {
             let s = u.tk.decode(&u.emitted[u.k0..], false).unwrap_or_default();

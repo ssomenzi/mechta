@@ -1,0 +1,313 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>mechta trace</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&family=Material+Symbols+Outlined:opsz,wght@20..24,400&display=swap" rel="stylesheet">
+<style>
+  :root {
+    --bg: #121212; --surface: #1E1E1E; --surface2: #262626; --line: #333;
+    --primary: #BB86FC; --secondary: #03DAC6; --error: #CF6679;
+    --text: #FFFFFF; --text2: #B3B3B3;
+  }
+  @media (prefers-color-scheme: light) {
+    :root { --bg: #FAFAFA; --surface: #FFFFFF; --surface2: #F0F0F0; --line: #DDD; --primary: #6200EE; --text: #212121; --text2: #616161; }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--text); font: 14px Inter, system-ui, sans-serif; }
+  .icon { font-family: 'Material Symbols Outlined'; font-size: 20px; line-height: 1; vertical-align: middle; }
+  header { display: flex; flex-wrap: wrap; align-items: center; gap: 12px; padding: 12px 16px; background: var(--surface);
+           box-shadow: 0 2px 4px rgba(0,0,0,.4); position: sticky; top: 0; z-index: 2; }
+  h1 { font-size: 20px; font-weight: 600; margin: 0 8px 0 0; }
+  .chip { padding: 4px 10px; border-radius: 16px; background: var(--surface2); color: var(--text2); font-size: 12px; }
+  .chip.live { color: var(--secondary); } .chip.bad { color: var(--error); }
+  .spacer { flex: 1; }
+  button, select { font: inherit; color: var(--text); background: var(--surface2); border: 1px solid var(--line);
+                   border-radius: 6px; padding: 6px 10px; cursor: pointer; transition: background .3s ease; }
+  button:hover, select:hover { background: var(--line); }
+  label { color: var(--text2); font-size: 12px; display: flex; align-items: center; gap: 6px; }
+  main { padding: 16px; }
+  .cards { display: grid; grid-template-columns: repeat(auto-fill, minmax(180px, 1fr)); gap: 12px; margin-bottom: 16px; }
+  .card { background: var(--surface); border-radius: 8px; padding: 12px; box-shadow: 0 1px 3px rgba(0,0,0,.4); }
+  .card .k { color: var(--text2); font-size: 12px; }
+  .card .v { font-size: 22px; font-weight: 600; white-space: nowrap; margin-top: 4px; font-variant-numeric: tabular-nums; }
+  .card .s { color: var(--text2); font-size: 12px; }
+  .panel { background: var(--surface); border-radius: 8px; padding: 8px; box-shadow: 0 1px 3px rgba(0,0,0,.4); position: relative; }
+  canvas { display: block; width: 100%; }
+  .hint { color: var(--text2); font-size: 12px; margin: 8px 4px 0; min-height: 16px; }
+  .legend { display: flex; flex-wrap: wrap; gap: 6px 16px; margin-top: 12px; color: var(--text2); font-size: 12px; }
+  .legend .scale::before { display: none; }
+  .legend .grad { display: inline-block; width: 80px; height: 10px; border-radius: 2px; margin: 0 6px; vertical-align: -1px;
+                  border: 1px solid var(--line); background: linear-gradient(to right, rgba(3,218,198,0), rgba(3,218,198,1)); }
+  .legend span::before { content: ""; display: inline-block; width: 10px; height: 10px; border-radius: 2px; margin-right: 6px;
+                         background: var(--c); vertical-align: -1px; }
+  #tip { position: fixed; pointer-events: none; background: var(--surface2); border: 1px solid var(--line); border-radius: 6px;
+         padding: 8px 10px; font-size: 12px; display: none; z-index: 3; white-space: pre; }
+</style>
+</head>
+<body>
+<header>
+  <h1 data-t="title">mechta trace</h1>
+  <span id="status" class="chip"></span>
+  <span id="level" class="chip"></span>
+  <span class="spacer"></span>
+  <label><span data-t="window"></span>
+    <select id="win"><option value="1">1 s</option><option value="3" selected>3 s</option><option value="10">10 s</option></select></label>
+  <label><span data-t="language"></span>
+    <select id="lang"><option value="en">English</option><option value="it">Italiano</option></select></label>
+  <button id="pause"><span class="icon" id="pause-icon">pause</span> <span id="pause-text"></span></button>
+</header>
+<main>
+  <div class="cards">
+    <div class="card"><div class="k" data-t="card_gpu_busy"></div><div class="v" id="c-busy"></div></div>
+    <div class="card"><div class="k" data-t="card_cpu"></div><div class="v" id="c-cpu"></div><div class="s" id="c-cpu-s"></div></div>
+    <div class="card"><div class="k" data-t="card_engine"></div><div class="v" id="c-eng"></div><div class="s" id="c-eng-s"></div></div>
+    <div class="card"><div class="k" data-t="card_gaps"></div><div class="v" id="c-gaps"></div></div>
+    <div class="card"><div class="k" data-t="card_attn_gen"></div><div class="v" id="c-attn-gen"></div><div class="s" data-t="of_gpu"></div></div>
+    <div class="card"><div class="k" data-t="card_attn_prefill"></div><div class="v" id="c-attn-pre"></div><div class="s" data-t="of_gpu"></div></div>
+    <div class="card"><div class="k" data-t="card_kv"></div><div class="v" id="c-kv"></div></div>
+    <div class="card"><div class="k" data-t="card_tokens"></div><div class="v" id="c-tok"></div></div>
+    <div class="card"><div class="k" data-t="card_clock"></div><div class="v" id="c-clock"></div></div>
+  </div>
+  <div class="panel"><canvas id="cv"></canvas></div>
+  <div class="hint" id="hint"></div>
+  <div class="legend" id="legend"></div>
+</main>
+<div id="tip"></div>
+<script>
+"use strict";
+// Colors of the programs (GPU submits), of the attention groups and of the engine phases.
+const PROG = { double: "#BB86FC", draft: "#03DAC6", draft2: "#03DAC6", prefill: "#FFB74D", step: "#64B5F6" };
+const GROUP = { "attn.pre": "#9575CD", "attn.kv_write": "#4DB6AC", "attn.core": "#F06292", "attn.merge": "#FFD54F", "attn.post": "#81C784" };
+const PHASE = { wait: "#555", prep: "#FF8A65", submit: "#FF7043", sample: "#F48FB1", emit: "#AED581", inputs: "#FFF176",
+                prefix_reuse: "#4FC3F7", root_load: "#4FC3F7", root_save: "#4FC3F7", block_choice: "#4FC3F7", send: "#AED581" };
+const GEN = new Set(["double", "draft", "draft2", "step"]);
+const KEEP_NS = 30e9;          // events kept in the page: 30 s
+const LAG_NS = 150e6;          // the right edge is 150 ms behind "now": events of the last submits are still arriving
+
+let L = {}, lang = "en";
+const t = (k, v = {}) => (L[k] ?? k).replace(/\{(\w+)\}/g, (_, x) => v[x] ?? "");
+const nf = (d) => new Intl.NumberFormat(lang, { maximumFractionDigits: d, minimumFractionDigits: d });
+async function loadLang(l) {
+  lang = l; document.documentElement.lang = l;
+  try { localStorage.setItem("mechta-trace-lang", l); } catch (_) {}
+  L = await (await fetch(`/trace/locales/${l}.json`)).json();
+  document.querySelectorAll("[data-t]").forEach(e => e.textContent = t(e.dataset.t));
+  document.title = t("title");
+  legend(); status();
+}
+
+// state
+let ev = [], level = null, serverNow = 0, clientAt = 0, connected = false, paused = false, view = null, lost = 0;
+// paused by the page itself because the server went away (not by the user): it resumes when the server is back
+let autoPaused = false;
+const winSel = document.getElementById("win"), cv = document.getElementById("cv"), ctx = cv.getContext("2d");
+
+function status() {
+  const s = document.getElementById("status");
+  if (level === 0) { s.textContent = t("status_off"); s.className = "chip bad"; }
+  else if (!connected && autoPaused) { s.textContent = t("status_stopped"); s.className = "chip bad"; }
+  else if (!connected) { s.textContent = t("status_disconnected"); s.className = "chip bad"; }
+  else { s.textContent = paused ? t("status_paused") : t("status_live"); s.className = "chip" + (paused ? "" : " live"); }
+  document.getElementById("level").textContent = level ? t("level", { n: level }) : "";
+  document.getElementById("pause-icon").textContent = paused ? "play_arrow" : "pause";
+  document.getElementById("pause-text").textContent = paused ? t("resume") : t("pause");
+  document.getElementById("hint").textContent = paused ? t("zoom_hint") : (lost ? t("lost", { n: lost }) : "");
+}
+function legend() {
+  const items = [...Object.entries(PROG).filter(([k]) => k !== "draft2"), ...Object.entries(GROUP), ...Object.entries(PHASE).filter(([k]) => !["root_load", "root_save", "block_choice", "submit"].includes(k))];
+  document.getElementById("legend").innerHTML = items.map(([k, c]) => `<span style="--c:${c}">${k}</span>`).join("") +
+    `<span style="--c:var(--error)">${t("lane_gaps")}</span>` +
+    `<span class="scale">${t("legend_cpu")}: 0 %<i class="grad"></i>100 %</span>` +
+    `<span style="--c:var(--primary)">${t("legend_busywait")}</span>`;
+}
+
+function connect() {
+  const es = new EventSource("/trace/stream");
+  es.onopen = () => { connected = true; status(); };
+  es.onerror = () => {
+    // the server went away: freeze the view on the last data received, so it can still be zoomed and read
+    if (connected && !paused && serverNow) { paused = true; autoPaused = true; const end = serverNow - LAG_NS; view = [end - winSel.value * 1e9, end]; }
+    connected = false; status();
+  };
+  es.onmessage = (m) => {
+    const d = JSON.parse(m.data);
+    if ("level" in d) { level = d.level; status(); if (level === 0) es.close(); return; }
+    // a new server process starts its clock from zero: the old events would be in the future, drop them
+    if (d.now < serverNow) { ev = []; lost = 0; }
+    if (autoPaused) { paused = false; autoPaused = false; view = null; status(); }
+    serverNow = d.now; clientAt = performance.now();
+    if (d.lost) { lost += d.lost; status(); }
+    for (const e of d.ev) ev.push(e);
+    if (!paused && ev.length && ev[0].t1 < serverNow - KEEP_NS) { const cut = serverNow - KEEP_NS; ev = ev.filter(e => e.t1 >= cut); }
+  };
+}
+
+// the visible window [a, b] in trace ns
+function range() {
+  if (paused && view) return view;
+  const end = serverNow + (performance.now() - clientAt) * 1e6 - LAG_NS;
+  return [end - winSel.value * 1e9, end];
+}
+
+// lanes: [key, label key, height]
+function lanes() {
+  const cores = ev.reduce((m, e) => e.k === "cpu.load" ? Math.max(m, e.ly + 1) : m, 0);
+  return [["gpu", "lane_gpu", 22], ["attn", "lane_attn", 22], ["gaps", "lane_gaps", 10], ["engine", "lane_engine", 22],
+          ["http", "lane_http", 12], ["root", "lane_root", 12], ["cpu", "lane_cpu", Math.max(cores, 1) * 4], ["clock", "lane_clock", 40]];
+}
+const LABEL_W = 150;
+
+function draw() {
+  requestAnimationFrame(draw);
+  const dpr = window.devicePixelRatio || 1, ls = lanes();
+  const h = ls.reduce((s, l) => s + l[2] + 8, 8);
+  const w = cv.clientWidth;
+  if (cv.width !== Math.round(w * dpr) || cv.height !== Math.round(h * dpr)) { cv.width = w * dpr; cv.height = h * dpr; cv.style.height = h + "px"; }
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  const css = getComputedStyle(document.documentElement);
+  ctx.clearRect(0, 0, w, h);
+  const [a, b] = range(), pw = w - LABEL_W - 8, x = (ns) => LABEL_W + (ns - a) / (b - a) * pw;
+  const y = {}; let yy = 8;
+  ctx.font = "12px Inter, system-ui, sans-serif"; ctx.textBaseline = "middle";
+  for (const [k, lab, hh] of ls) {
+    y[k] = [yy, hh];
+    ctx.fillStyle = css.getPropertyValue("--text2"); ctx.fillText(t(lab), 8, yy + hh / 2);
+    ctx.fillStyle = css.getPropertyValue("--surface2"); ctx.fillRect(LABEL_W, yy, pw, hh);
+    yy += hh + 8;
+  }
+  const vis = ev.filter(e => e.t1 >= a && e.t0 <= b);
+  const bar = (k, e, color, sub = 0, n = 1) => {
+    const [ty, th] = y[k], x0 = Math.max(x(e.t0), LABEL_W), x1 = Math.min(x(e.t1), LABEL_W + pw);
+    ctx.fillStyle = color; ctx.fillRect(x0, ty + sub * th / n, Math.max(x1 - x0, 0.75), th / n);
+  };
+  const gpu = vis.filter(e => e.k === "gpu").sort((p, q) => p.t0 - q.t0);
+  for (const e of gpu) bar("gpu", e, PROG[e.l] || "#90A4AE");
+  for (const e of vis) {
+    if (GROUP[e.k]) bar("attn", e, GROUP[e.k]);
+    else if (e.th === 0 && PHASE[e.k]) bar("engine", e, PHASE[e.k]);
+    else if (e.th === 1 && PHASE[e.k]) bar("http", e, PHASE[e.k]);
+    else if (e.th === 2 && PHASE[e.k]) bar("root", e, PHASE[e.k]);
+  }
+  for (let i = 1; i < gpu.length; i++) {
+    const g0 = gpu[i - 1].t1, g1 = gpu[i].t0;
+    if (g1 > g0 && g1 - g0 < 1e9) bar("gaps", { t0: g0, t1: g1 }, css.getPropertyValue("--error"));
+  }
+  const [cy, ch] = y.cpu;
+  for (const e of vis) if (e.k === "cpu.load") {
+    ctx.fillStyle = `rgba(3,218,198,${Math.min(1, e.by / 1000)})`;
+    const x0 = Math.max(x(e.t0), LABEL_W), x1 = Math.min(x(e.t1), LABEL_W + pw);
+    ctx.fillRect(x0, cy + e.ly * 4, Math.max(x1 - x0, 1), 3);
+  }
+  // busy-wait: on the core the engine thread ran on, the share of the sample it spent waiting for the GPU
+  const waits = vis.filter(e => e.th === 0 && e.k === "wait");
+  ctx.fillStyle = css.getPropertyValue("--primary");
+  for (const e of vis) if (e.k === "engine.cpu") {
+    const f = waitShare(waits, e.t0, e.t1);
+    if (f < 0.05) continue;
+    const x0 = Math.max(x(e.t0), LABEL_W), x1 = Math.min(x(e.t1), LABEL_W + pw);
+    ctx.globalAlpha = Math.min(1, f); ctx.fillRect(x0, cy + e.ly * 4, Math.max(x1 - x0, 1), 3); ctx.globalAlpha = 1;
+  }
+  const line = (kind, max, color) => {
+    const [ly, lh] = y.clock; ctx.strokeStyle = color; ctx.lineWidth = 1.5; ctx.beginPath(); let first = true;
+    for (const e of vis) if (e.k === kind) { const px = x(e.t0), py = ly + lh - Math.min(e.by / max, 1) * lh; first ? ctx.moveTo(px, py) : ctx.lineTo(px, py); first = false; }
+    ctx.stroke();
+  };
+  line("gpu.clock", 3000, css.getPropertyValue("--primary")); line("gpu.busy", 100, css.getPropertyValue("--secondary"));
+  cards(vis, gpu, a, b);
+}
+
+// share of [t0, t1] covered by the engine's wait spans
+function waitShare(waits, t0, t1) {
+  let s = 0;
+  for (const w of waits) s += Math.max(0, Math.min(w.t1, t1) - Math.max(w.t0, t0));
+  return s / Math.max(t1 - t0, 1);
+}
+
+function cards(vis, gpu, a, b) {
+  const span = b - a; let busy = 0, gaps = 0, gapNs = 0;
+  for (let i = 0; i < gpu.length; i++) {
+    busy += Math.min(gpu[i].t1, b) - Math.max(gpu[i].t0, a);
+    if (i > 0) { const g = gpu[i].t0 - gpu[i - 1].t1; if (g > 0 && g < 1e9) { gaps++; gapNs += g; } }
+  }
+  const gs = { gen: [0, 0], pre: [0, 0] }; let kvB = 0, kvT = 0, tok = 0, clock = null;
+  for (const e of vis) {
+    const cls = GEN.has(e.l) ? "gen" : e.l === "prefill" ? "pre" : null;
+    if (e.k === "gpu" && cls) gs[cls][1] += e.t1 - e.t0;
+    if (GROUP[e.k] && cls) gs[cls][0] += e.t1 - e.t0;
+    if (e.k === "attn.core") { kvB += e.by; kvT += e.t1 - e.t0; }
+    if (e.k === "emit") tok++;
+    if (e.k === "gpu.clock") clock = e.by;
+  }
+  const pct = (p) => p[1] ? nf(0).format(100 * p[0] / p[1]) + " %" : t("none");
+  set("c-busy", gpu.length ? nf(0).format(100 * busy / span) + " %" : t("none"));
+  set("c-gaps", t("card_gaps_value", { n: gaps, ms: nf(1).format(gapNs / 1e6) }));
+  set("c-attn-gen", pct(gs.gen)); set("c-attn-pre", pct(gs.pre));
+  set("c-kv", kvT ? nf(1).format(kvB / kvT) + " " + t("unit_gbs") : t("none"));
+  set("c-tok", nf(1).format(tok / (span / 1e9)));
+  set("c-clock", clock ? nf(0).format(clock) + " " + t("unit_mhz") : t("none"));
+  // CPU: the whole machine and the busiest core as the OS sees them (samples of 100 ms), and the engine thread from
+  // its events (exact), next to what the OS reports for it
+  const per = {}; let os = [0, 0];
+  for (const e of vis) {
+    if (e.k === "cpu.load") { (per[e.ly] ??= []).push(e.by / 10); }
+    if (e.k === "engine.cpu") { os[0] += e.by / 10; os[1]++; }
+  }
+  const means = Object.values(per).map(v => v.reduce((s, x) => s + x, 0) / v.length);
+  const p0 = (v) => nf(0).format(v) + " %";
+  set("c-cpu", means.length ? p0(means.reduce((s, x) => s + x, 0) / means.length) : t("none"));
+  set("c-cpu-s", means.length ? t("cpu_sub", { p: p0(Math.max(...means)) }) : "");
+  let wait = 0, work = 0;
+  for (const e of vis) if (e.th === 0 && PHASE[e.k]) {
+    const d = Math.max(0, Math.min(e.t1, b) - Math.max(e.t0, a));
+    if (e.k === "wait") wait += d; else work += d;
+  }
+  set("c-eng", t("eng_value", { w: p0(100 * work / span) }));
+  set("c-eng-s", t("eng_sub", { wt: p0(100 * wait / span), os: os[1] ? p0(os[0] / os[1]) : t("none") }));
+}
+const set = (id, v) => { const e = document.getElementById(id); if (e.textContent !== v) e.textContent = v; };
+
+// pause, zoom and pan on the paused view; tooltip
+document.getElementById("pause").onclick = () => { paused = !paused; autoPaused = false; view = paused ? (view || range()) : null; status(); };
+cv.addEventListener("wheel", (e) => {
+  if (!paused) return; e.preventDefault();
+  const r = cv.getBoundingClientRect(), f = (e.clientX - r.left - LABEL_W) / (r.width - LABEL_W - 8);
+  const [a, b] = view, c = a + (b - a) * Math.min(Math.max(f, 0), 1), k = e.deltaY > 0 ? 1.25 : 0.8;
+  view = [c - (c - a) * k, c + (b - c) * k];
+}, { passive: false });
+let drag = null;
+cv.addEventListener("mousedown", (e) => { if (paused) drag = [e.clientX, ...view]; });
+window.addEventListener("mouseup", () => drag = null);
+window.addEventListener("mousemove", (e) => {
+  const tip = document.getElementById("tip");
+  if (drag) { const r = cv.getBoundingClientRect(), d = (e.clientX - drag[0]) / (r.width - LABEL_W - 8) * (drag[2] - drag[1]); view = [drag[1] - d, drag[2] - d]; }
+  const r = cv.getBoundingClientRect();
+  if (e.clientX < r.left + LABEL_W || e.clientX > r.right || e.clientY < r.top || e.clientY > r.bottom) { tip.style.display = "none"; return; }
+  const [a, b] = range(), ns = a + (e.clientX - r.left - LABEL_W) / (r.width - LABEL_W - 8) * (b - a);
+  let ly = e.clientY - r.top - 8, lane = null;
+  for (const [k, , hh] of lanes()) { if (ly >= 0 && ly <= hh) { lane = k; break; } ly -= hh + 8; }
+  const hit = ev.find(q => q.t0 <= ns && ns <= q.t1 && (
+    (lane === "gpu" && q.k === "gpu") || (lane === "attn" && GROUP[q.k]) ||
+    (lane === "engine" && q.th === 0 && PHASE[q.k]) || (lane === "http" && q.th === 1) || (lane === "root" && q.th === 2)));
+  if (!hit) { tip.style.display = "none"; return; }
+  const dur = hit.t1 - hit.t0, lines = [`${hit.k === "gpu" ? hit.l : hit.k}${hit.l && hit.k !== "gpu" ? " (" + hit.l + ")" : ""}`,
+    `${t("tip_duration")}: ${dur > 1e6 ? nf(2).format(dur / 1e6) + " " + t("unit_ms") : nf(0).format(dur / 1e3) + " " + t("unit_us")}`];
+  if (hit.ly !== 255) lines.push(`${t("tip_layer")}: ${hit.ly}`);
+  if (hit.pos) lines.push(`${t("tip_pos")}: ${nf(0).format(hit.pos)}`);
+  if (hit.n) lines.push(`${t("tip_tokens")}: ${hit.n}`);
+  if (hit.b) lines.push(`${t("tip_block")}: ${hit.b}`);
+  if (hit.by && hit.k === "attn.core") lines.push(`${t("tip_kv")}: ${nf(1).format(hit.by / 1e6)} MB · ${nf(1).format(hit.by / dur)} ${t("unit_gbs")}`);
+  tip.textContent = lines.join("\n"); tip.style.display = "block"; tip.style.left = (e.clientX + 14) + "px"; tip.style.top = (e.clientY + 14) + "px";
+});
+
+const langSel = document.getElementById("lang");
+let saved = null; try { saved = localStorage.getItem("mechta-trace-lang"); } catch (_) {}
+const start = saved || (navigator.language || "en").slice(0, 2);
+langSel.value = ["en", "it"].includes(start) ? start : "en";
+langSel.onchange = () => loadLang(langSel.value);
+loadLang(langSel.value).then(() => { connect(); requestAnimationFrame(draw); });
+</script>
+</body>
+</html>

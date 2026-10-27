@@ -6,6 +6,7 @@ mod engine;
 mod tools;
 mod memcheck;
 mod compare;
+mod dmx;
 mod wgsl_check;
 pub mod session;
 pub mod flint;
@@ -83,6 +84,7 @@ fn main() {
                 Err(m) => { println!("{m}"); std::process::exit(1); }
             }
         }
+        Some("quad-check") => engine::quad_check(&args[2], args[3].parse().expect("prefill"), args[4].parse().expect("cycles")),
         Some("test-budget") => session::test_budget(args.get(2).and_then(|v| v.parse().ok()).unwrap_or(256), args.get(3).and_then(|v| v.parse().ok()).unwrap_or(1500)),
         Some("deq") => deq(&args[2], args[3].parse().expect("N"), &args[4]),
         _ => eprintln!("usage: mechta serve [--ctx N] | check-memory [ctx] | logit-dump | kl | flint-logit-dump | test-budget | inspect [file.gguf] | token <text.txt> <llamacpp_ids.bin> | deq <tensor> <N> <reference.f32>"),

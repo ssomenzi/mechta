@@ -19,3 +19,24 @@ fn merge() {
   }
   o[0] = n;
 }
+
+// k-token step: union of the experts of 4 rows (ids of row t at a[t*8 ..]). One thread.
+// o = [n, then per expert: id, slot0, slot1, slot2, slot3] (slot 0xFFFF = the row does not use it), in order of first use.
+@compute @workgroup_size(1)
+fn merge4() {
+  var n = 0u;
+  for (var t: u32 = 0u; t < 4u; t++) {
+    for (var k: u32 = 0u; k < 8u; k++) {
+      let e = a[t * 8u + k];
+      var f = n;
+      for (var z: u32 = 0u; z < n; z++) { if (o[1u + 5u * z] == e) { f = z; } }
+      if (f == n) {
+        o[1u + 5u * n] = e;
+        for (var s: u32 = 0u; s < 4u; s++) { o[2u + 5u * n + s] = 0xFFFFu; }
+        n++;
+      }
+      o[2u + 5u * f + t] = k;
+    }
+  }
+  o[0] = n;
+}

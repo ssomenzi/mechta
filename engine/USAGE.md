@@ -55,6 +55,10 @@ GPU health): the server starts only if it exits with 0. The script passes on the
 | `MECHTA_MTP=no` | no MTP (multi-token prediction) |
 | `MECHTA_MTP_TAIL=N` | single-step tail tokens for the MTP cache (default 8) |
 | `MECHTA_MTP_ACCEPT=exact\|greedy` | acceptance rule for MTP drafts (default exact; greedy = like ds4) |
+| `MECHTA_STEP4=0` | generation with the double step (the sure token + 1 MTP draft) instead of the 4-token step. The 4-token step (default with the f16 KV cache and a model with MTP) checks the sure token + 3 drafts in one pass: the MTP layer on the accepted rows, then 2 more MTP drafts in a chain. Measured on the real server: +13-21% at 12K-108K with greedy sampling, +7-12% at temperature 0.6. The startup log prints `generation: 4-token step` |
+| `MECHTA_ATTN2=fd2h` | decode attention of the double step with the older scalar kernel (`attn_fd2h`). Default with the f16 KV cache: `attn_dmx`, on the matrix units of RDNA 3 (-8.6% per double step at 108K). The startup log prints `decode attention: ...` |
+| `MECHTA_TRACE=1\|2` | real-time trace (default 0 = off): 1 = submits and CPU phases, 2 = also the attention groups inside a pass. The page `/trace` of the server shows it live |
+| `MECHTA_TRACE_FILE=<file>` | with `MECHTA_TRACE`, also writes the events as JSON lines; `engine/tools/trace-export.py` converts them for Perfetto (ui.perfetto.dev) or chrome://tracing |
 | `MECHTA_DRAFT_HEAD=no\|<file>` | MTP drafts with the full output head (default: reduced to the 32.6K tokens of `engine/draft-head.tsv`, +5-10% with the same acceptance); a file name selects another token list |
 | `MECHTA_ATTN_PIECES=N` | attention dispatches per submit in the prefill (default 2: the desktop stays responsive) |
 | `MECHTA_RESERVE_GB=N` | VRAM kept free while the weights load (default 0; the script sets 2) |
@@ -114,6 +118,9 @@ the prefill). It keeps `MECHTA_ROOTS` of them (default 6) per format; the least 
 - `mechta logit-dump <text> <prefill> <steps> <out.bin> [single|double]`: logits on real text, for the engine as
   configured by the environment variables (for example `MECHTA_KV`). `double` uses the double step of MTP generation.
   Uses the GPU (loads the model). `mechta flint-logit-dump` does the same for a Flint model.
+- `mechta quad-check <text> <prefill> <cycles>`: deterministic check of the 4-token step. From the same state, the
+  4-token rows (with drafts made wrong at chosen rows, so every way back is tested) against single steps on the same
+  tokens, compared with the double step; then the MTP on 1-4 rows against the single-draft path. Prints PASS or FAIL.
 - The alternative kernels, the older versions and the measurement commands are kept in the `lab` branch of the
   repository and described in its `engine/VARIANTS.md`; this branch has only what the server uses.
 - `mechta kl <ref.bin> <var.bin> [limits]`: mean / p99 / max KL, first-choice agreement, NLL of both. CPU only. Limits

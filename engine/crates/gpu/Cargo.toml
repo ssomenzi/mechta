@@ -8,3 +8,4 @@ license.workspace = true
 wgpu = "30.0.1"
 pollster = "1.0.1"
 mechta-shader = { path = "../shader" }
+mechta-trace = { path = "../trace" }

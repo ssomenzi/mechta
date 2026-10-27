@@ -1037,6 +1037,7 @@ name = "mechta-gpu"
 version = "0.1.0"
 dependencies = [
  "mechta-shader",
+ "mechta-trace",
  "pollster",
  "wgpu",
 ]
@@ -1047,6 +1048,7 @@ version = "0.1.0"
 dependencies = [
  "mechta-api",
  "mechta-chat",
+ "mechta-trace",
  "serde_json",
 ]
 
@@ -1056,6 +1058,10 @@ version = "0.1.0"
 dependencies = [
  "wgpu",
 ]
+
+[[package]]
+name = "mechta-trace"
+version = "0.1.0"
 
 [[package]]
 name = "mechta-tui"

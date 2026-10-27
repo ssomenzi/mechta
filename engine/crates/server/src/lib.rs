@@ -8,6 +8,7 @@
 mod titles;
 
 mod http;
+mod trace_page;
 
 use std::net::{TcpListener, TcpStream};
 use std::sync::Arc;
@@ -147,7 +148,7 @@ pub fn start(create_engine: Box<dyn FnOnce() -> Box<dyn mechta_api::Engine> + Se
                 let slot = ConnectionSlot;
                 let state = Arc::clone(&state);
                 let tx = tx_jobs.clone();
-                let r = std::thread::Builder::new().name("http".into()).spawn(move || { let _slot = slot; handle(sock, &state, &tx) });
+                let r = std::thread::Builder::new().name("http".into()).spawn(move || { let _slot = slot; mechta_trace::set_thread(mechta_trace::HTTP); handle(sock, &state, &tx) });
                 if let Err(e) = r {
                     log(&format!("ERROR: connection thread not created: {e}"));
                 }
@@ -169,6 +170,7 @@ fn engine_loop(
     tx_info: mpsc::Sender<Info>,
     rx_jobs: mpsc::Receiver<Job>,
 ) {
+    mechta_trace::mark_engine_thread();
     let mut engine = create_engine();
     let context = engine.max_context();
     if tx_info.send(Info { name: engine.model_name().to_string(), context }).is_err() {
@@ -223,6 +225,7 @@ fn handle(mut sock: TcpStream, state: &State, tx: &mpsc::Sender<Job>) {
         let _ = http::respond_json(&mut sock, 401, &error_json("API key missing or wrong (Authorization: Bearer ...)", "authentication_error", Some("invalid_api_key")));
         return;
     }
+    if trace_page::route(&mut sock, method, path) { return; }
     match path {
         "/v1/models" if method == "GET" => {
             let body = json!({
@@ -584,7 +587,9 @@ fn completion(sock: &mut TcpStream, body: &[u8], state: &State, tx: &mpsc::Sende
             if let Some(d) = output.delta(ev)
                 && let Some(s) = sse.as_mut()
             {
+                let ts = mechta_trace::start();
                 if s.data(&output.piece(d, None)).is_err() { gone = true; } else { last_byte = Instant::now(); }
+                mechta_trace::span(mechta_trace::Kind::Send, ts, |e| e.label = "http");
             }
         }
         // the silence is measured on the bytes really sent, not on the pieces of the engine. While the model

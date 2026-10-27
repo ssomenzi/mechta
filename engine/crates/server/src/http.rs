@@ -136,6 +136,7 @@ fn status_text(state: u16) -> &'static str {
         200 => "OK",
         400 => "Bad Request",
         401 => "Unauthorized",
+        403 => "Forbidden",
         404 => "Not Found",
         405 => "Method Not Allowed",
         408 => "Request Timeout",
@@ -146,6 +147,19 @@ fn status_text(state: u16) -> &'static str {
         503 => "Service Unavailable",
         _ => "Status",
     }
+}
+
+/// Complete response with the given content type (the trace page and its texts).
+pub fn respond(sock: &mut TcpStream, state: u16, content_type: &str, body: &str) -> std::io::Result<()> {
+    let head = format!(
+        "HTTP/1.1 {state} {}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n",
+        status_text(state),
+        body.len()
+    );
+    let mut all = head.into_bytes();
+    all.extend_from_slice(body.as_bytes());
+    sock.write_all(&all)?;
+    sock.flush()
 }
 
 /// Complete response, with JSON body.
