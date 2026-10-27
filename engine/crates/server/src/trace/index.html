@@ -79,11 +79,12 @@
 <script>
 "use strict";
 // Colors of the programs (GPU submits), of the attention groups and of the engine phases.
-const PROG = { double: "#BB86FC", draft: "#03DAC6", draft2: "#03DAC6", prefill: "#FFB74D", step: "#64B5F6" };
+const PROG = { quad: "#CE93D8", draft4: "#03DAC6", flush4: "#B39DDB", double: "#BB86FC", draft: "#03DAC6", draft2: "#03DAC6",
+               prefill: "#FFB74D", step: "#64B5F6" };
 const GROUP = { "attn.pre": "#9575CD", "attn.kv_write": "#4DB6AC", "attn.core": "#F06292", "attn.merge": "#FFD54F", "attn.post": "#81C784" };
 const PHASE = { wait: "#555", prep: "#FF8A65", submit: "#FF7043", sample: "#F48FB1", emit: "#AED581", inputs: "#FFF176",
                 prefix_reuse: "#4FC3F7", root_load: "#4FC3F7", root_save: "#4FC3F7", block_choice: "#4FC3F7", send: "#AED581" };
-const GEN = new Set(["double", "draft", "draft2", "step"]);
+const GEN = new Set(["quad", "draft4", "flush4", "double", "draft", "draft2", "step"]);
 const KEEP_NS = 30e9;          // events kept in the page: 30 s
 const LAG_NS = 150e6;          // the right edge is 150 ms behind "now": events of the last submits are still arriving
 
@@ -117,7 +118,7 @@ function status() {
   document.getElementById("hint").textContent = paused ? t("zoom_hint") : (lost ? t("lost", { n: lost }) : "");
 }
 function legend() {
-  const items = [...Object.entries(PROG).filter(([k]) => k !== "draft2"), ...Object.entries(GROUP), ...Object.entries(PHASE).filter(([k]) => !["root_load", "root_save", "block_choice", "submit"].includes(k))];
+  const items = [...Object.entries(PROG).filter(([k]) => !["draft2", "draft4"].includes(k)), ...Object.entries(GROUP), ...Object.entries(PHASE).filter(([k]) => !["root_load", "root_save", "block_choice", "submit"].includes(k))];
   document.getElementById("legend").innerHTML = items.map(([k, c]) => `<span style="--c:${c}">${k}</span>`).join("") +
     `<span style="--c:var(--error)">${t("lane_gaps")}</span>` +
     `<span class="scale">${t("legend_cpu")}: 0 %<i class="grad"></i>100 %</span>` +
