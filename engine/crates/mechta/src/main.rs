@@ -85,7 +85,12 @@ fn main() {
             }
         }
         Some("quad-check") => engine::quad_check(&args[2], args[3].parse().expect("prefill"), args[4].parse().expect("cycles")),
-        Some("test-budget") => session::test_budget(args.get(2).and_then(|v| v.parse().ok()).unwrap_or(256), args.get(3).and_then(|v| v.parse().ok()).unwrap_or(1500)),
+        Some("test-budget") => {
+            // one budget ("256") or a range ("32-47"), all on the same loaded model
+            let b = args.get(2).map(|s| s.as_str()).unwrap_or("256");
+            let (lo, hi) = match b.split_once('-') { Some((x, y)) => (x.parse().expect("budget"), y.parse().expect("budget")), None => { let x = b.parse().expect("budget"); (x, x) } };
+            session::test_budget(&(lo..=hi).collect::<Vec<usize>>(), args.get(3).and_then(|v| v.parse().ok()).unwrap_or(1500))
+        }
         Some("deq") => deq(&args[2], args[3].parse().expect("N"), &args[4]),
         _ => eprintln!("usage: mechta serve [--ctx N] | check-memory [ctx] | logit-dump | kl | flint-logit-dump | test-budget | inspect [file.gguf] | token <text.txt> <llamacpp_ids.bin> | deq <tensor> <N> <reference.f32>"),
     }

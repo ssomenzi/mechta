@@ -383,11 +383,19 @@ impl Engine for Session {
                     }
                     let t_sample = ts.elapsed().as_secs_f64() * 1e3;
                     let mut na = 0; while na < 3 && a[na] == ds[na] { na += 1; }
-                    m.accept4(na + 1);
                     cycles += 3; accepted += na; steps4 += 1;
-                    fed = pos + 1 + na;
-                    for &t in &ds[..na] { if let Some(f) = u.emit(t) { break 'q f; } }
-                    if let Some(f) = u.emit(a[na]) { break 'q f; }
+                    // emit first, then accept: if the generation ends on an accepted draft (thinking budget, max
+                    // tokens, client gone), only the rows up to the last emitted token enter the state, so `fed` never
+                    // passes the output (a cut on the first of two accepted drafts read past the end of `emitted`)
+                    let before = u.emitted.len();
+                    let mut fin = None;
+                    for &t in &ds[..na] { fin = u.emit(t); if fin.is_some() { break; } }
+                    if fin.is_none() { fin = u.emit(a[na]); }
+                    let na_in = na.min(u.emitted.len() - before);
+                    if na_in < na { eprintln!("step4: generation ended on draft {na_in} of {na} accepted ({fin:?})"); }
+                    m.accept4(na_in + 1);
+                    fed = pos + 1 + na_in;
+                    if let Some(f) = fin { break 'q f; }
                     w_double += t_step; w_sample += t_sample; w_cycles += 1;
                     let toks: Vec<u32> = ds[..na].iter().copied().chain([a[na]]).collect();
                     pos += na + 1;
@@ -522,13 +530,23 @@ pub fn test_session(file: &str, max: usize) {
             a.chars().skip(common.saturating_sub(40)).take(80).collect::<String>(), b.chars().skip(common.saturating_sub(40)).take(80).collect::<String>()) });
 }
 
-/// `mechta test-budget <budget> [max_token]`: checks the thinking budget at temperature 0.
+/// `mechta test-budget <budget | first-last> [max_token]`: checks the thinking budget at temperature 0.
 /// 1. One request with the budget: the reasoning must be cut and closed with `CLOSE_THINKING`.
 /// 2. The same prompt plus the output up to the end of the closing text, without budget and without reuse (all
 ///    prefilled from zero): the answer must be the same text as in 1. This proves that the model state after the cut
 ///    (the closing text fed one token at a time after an MTP cycle) equals the state of a normal prefill.
-pub fn test_budget(budget: usize, max: usize) {
+/// A range of budgets runs every budget on the same loaded model: with the 4-token step the cut falls at different
+/// places inside a step (on the sure token, or on the first, second or third accepted draft).
+pub fn test_budget(budgets: &[usize], max: usize) {
     let mut s = Session::new();
+    for &budget in budgets {
+        println!("=== budget {budget}");
+        test_budget_one(&mut s, budget, max);
+        s.forget();
+    }
+}
+
+fn test_budget_one(s: &mut Session, budget: usize, max: usize) {
     let prompt = "<|im_start|>user\nA farmer has 17 sheep. All but 9 run away, then he buys twice as many as remain and sells 5. \
 Then a storm takes one third of the flock, rounded down. How many sheep are left? Check every step twice.<|im_end|>\n<|im_start|>assistant\n<think>\n";
     let run = |s: &mut Session, p: &str, budget: usize| -> (String, Outcome) {
@@ -540,11 +558,11 @@ Then a storm takes one third of the flock, rounded down. How many sheep are left
     if budget == 0 {
         // control (no budget): the same comparison with a plain cut of the output at a line end, to see how far a
         // continuation after a full prefill follows the generated text when nothing is injected
-        let (o1, e1) = run(&mut s, prompt, 0);
+        let (o1, e1) = run(s, prompt, 0);
         println!("--- control 1: generated {} tokens, end {:?}", e1.generated_tokens, e1.end);
         let cut = o1.char_indices().map(|(i, _)| i).filter(|&i| o1[i..].starts_with('\n')).find(|&i| s.tokenize(&o1[..i]).len() >= 280).map(|i| i + 1).unwrap_or(o1.len());
         s.forget();
-        let (o2, e2) = run(&mut s, &format!("{prompt}{}", &o1[..cut]), 0);
+        let (o2, e2) = run(s, &format!("{prompt}{}", &o1[..cut]), 0);
         println!("--- control 2: prompt {} tokens, generated {}", e2.token_prompt, e2.generated_tokens);
         let a = &o1[cut..];
         let same = a.chars().zip(o2.chars()).take_while(|(x, y)| x == y).count();
@@ -552,7 +570,7 @@ Then a storm takes one third of the flock, rounded down. How many sheep are left
         else { println!("RESULT control: differ from char {same}: generated {:?} · full prefill {:?}", a.chars().skip(same.saturating_sub(30)).take(80).collect::<String>(), o2.chars().skip(same.saturating_sub(30)).take(80).collect::<String>()); }
         return;
     }
-    let (o1, e1) = run(&mut s, prompt, budget);
+    let (o1, e1) = run(s, prompt, budget);
     println!("--- 1. budget {budget}: generated {} tokens, end {:?}", e1.generated_tokens, e1.end);
     let Some(k) = o1.find(CLOSE_THINKING) else { println!("RESULT: the reasoning was not cut (closing text not found)"); return; };
     let cut = k + CLOSE_THINKING.len();
@@ -562,7 +580,7 @@ Then a storm takes one third of the flock, rounded down. How many sheep are left
     println!("answer: {:?}", o1[cut..].chars().take(600).collect::<String>());
     s.forget();
     let p2 = format!("{prompt}{}", &o1[..cut]);
-    let (o2, e2) = run(&mut s, &p2, 0);
+    let (o2, e2) = run(s, &p2, 0);
     println!("--- 2. same text from a full prefill: prompt {} tokens, reused {}, generated {}", e2.token_prompt, e2.reused_tokens, e2.generated_tokens);
     let a = &o1[cut..];
     let same = a.chars().zip(o2.chars()).take_while(|(x, y)| x == y).count();
